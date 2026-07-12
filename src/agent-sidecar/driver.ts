@@ -129,6 +129,18 @@ export function createRunDriver(deps: RunDriverDeps): RunDriver {
     if (profile.sandbox !== true) {
       throw new SidecarGateError('PROFILE_NOT_SANDBOXED', `profile "${request.profileRef}" is not sandboxed`);
     }
+    // Discovery-safe gate (v1 accepts only mode:'discovery', and enforces it at
+    // the EXECUTING boundary, not just the caller): the physical sandbox must
+    // have network egress disabled (bwrap net unshare) and the no-escalation
+    // red line armed, or a "discovery" run could still produce external side
+    // effects. sandboxNetwork defaults to ON in botmux, so require the explicit
+    // false; disableCliBypass can never be cleared downstream (P2 red line).
+    if (profile.sandboxNetwork !== false || profile.disableCliBypass !== true) {
+      throw new SidecarGateError(
+        'PROFILE_NOT_DISCOVERY_SAFE',
+        `profile "${request.profileRef}" is not discovery-safe: requires sandboxNetwork=false and disableCliBypass=true`,
+      );
+    }
     let realCwd: string;
     try {
       realCwd = realpathSync(request.cwd);
@@ -288,8 +300,10 @@ export function createRunDriver(deps: RunDriverDeps): RunDriver {
       if (entry) {
         entry.controller.abort();
       } else if (!isLive(runId)) {
-        // Nobody is driving — fold to the cancelled terminal immediately.
-        await finalizeRun(store, runId, finalizeDeps);
+        // Nobody is driving — fold to the cancelled terminal immediately and
+        // report the post-fold snapshot (not a stale 'running').
+        const folded = await finalizeRun(store, runId, finalizeDeps);
+        if (folded) return { runId, state: folded.state, cancelRequested: true, alreadyTerminal: false };
       }
       return { runId, state: 'running', cancelRequested: true, alreadyTerminal: false };
     },
@@ -303,29 +317,42 @@ export function createRunDriver(deps: RunDriverDeps): RunDriver {
 // ─── Real usage collection (spec §8 — claude family via native transcript) ──
 
 /**
- * Fold the CLI-native transcript at the frozen (cliId, sessionId, cwd) anchor.
- * Honest by construction: missing/oversized transcript or a non-claude CLI →
- * usage absent + costComplete false (never fabricated zeros); collected usage
- * still reports costComplete false because no usd pricing exists in v1.
+ * Fold the CLI-native transcripts for ALL attempt sessions of the run (same
+ * cliId/cwd, per-attempt sessionId) and aggregate — a retry's usage is part of
+ * the run's cost.  Honest by construction: a non-claude CLI, or ANY attempt
+ * whose transcript is missing/oversized, drops completeness (partial usage is
+ * still reported, never fabricated zeros); and collected usage always reports
+ * costComplete false in v1 because no usd pricing exists (the record-level
+ * gate usageSatisfiesCostComplete would reject it anyway).
  */
 export function createClaudeUsageCollector(opts: { claudeDataDir?: string } = {}): CollectUsage {
   const dataDir = opts.claudeDataDir ?? join(homedir(), '.claude');
-  return (frozen: FrozenSession) => {
-    if (frozen.cliId !== 'claude-code') return { costComplete: false };
-    const transcriptPath = getClaudeSessionJsonlPath(frozen.sessionId, frozen.cwd, dataDir);
-    if (!transcriptPath) return { costComplete: false };
-    const usage = readSessionTokenUsageFile(transcriptPath, 'claude', { fresh: true });
-    if (!usage) return { costComplete: false };
-    return {
-      usage: {
-        model: usage.model,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheReadTokens: usage.cacheReadTokens,
-        cacheCreationTokens: usage.cacheCreateTokens,
-        turns: usage.turns,
-      },
-      costComplete: false, // v1: usd is never known (Phase 2 pricing gate)
-    };
+  return (sessions: FrozenSession[]) => {
+    let anyResolved = false;
+    let allResolved = true;
+    const sum = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 };
+    let model = '';
+    for (const s of sessions) {
+      if (s.cliId !== 'claude-code') {
+        allResolved = false;
+        continue;
+      }
+      const transcriptPath = getClaudeSessionJsonlPath(s.sessionId, s.cwd, dataDir);
+      const usage = transcriptPath ? readSessionTokenUsageFile(transcriptPath, 'claude', { fresh: true }) : null;
+      if (!usage) {
+        allResolved = false;
+        continue;
+      }
+      anyResolved = true;
+      sum.inputTokens += usage.inputTokens;
+      sum.outputTokens += usage.outputTokens;
+      sum.cacheReadTokens += usage.cacheReadTokens;
+      sum.cacheCreationTokens += usage.cacheCreateTokens;
+      sum.turns += usage.turns;
+      if (!model) model = usage.model;
+    }
+    if (!anyResolved) return { costComplete: false };
+    void allResolved; // v1: even a fully resolved run stays incomplete (no usd pricing)
+    return { usage: { model, ...sum }, costComplete: false };
   };
 }

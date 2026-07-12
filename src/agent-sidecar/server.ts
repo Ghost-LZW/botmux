@@ -16,6 +16,7 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { connect as netConnect } from 'node:net';
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 
@@ -87,6 +88,7 @@ function validateRunRequest(body: unknown): SidecarRunRequest | string {
   if (typeof o.goal !== 'string' || o.goal === '') return 'goal must be a non-empty string';
   if (typeof o.cwd !== 'string' || o.cwd === '') return 'cwd must be a non-empty string';
   if (typeof o.timeoutMs !== 'number' || !Number.isFinite(o.timeoutMs) || o.timeoutMs <= 0) return 'timeoutMs must be a positive number';
+  if (o.mode !== 'discovery') return 'mode must be "discovery" (the only mode botmux-goal-v1 accepts)';
   if (o.taskId !== undefined && typeof o.taskId !== 'string') return 'taskId must be a string when present';
   if (o.threadId !== undefined && typeof o.threadId !== 'string') return 'threadId must be a string when present';
   return {
@@ -97,6 +99,7 @@ function validateRunRequest(body: unknown): SidecarRunRequest | string {
     goal: o.goal,
     cwd: o.cwd,
     timeoutMs: o.timeoutMs,
+    mode: 'discovery',
     ...(o.taskId !== undefined ? { taskId: o.taskId as string } : {}),
     ...(o.threadId !== undefined ? { threadId: o.threadId as string } : {}),
   };
@@ -277,15 +280,49 @@ export function createSidecarServer(deps: SidecarServerDeps): Server {
   return server;
 }
 
+/** Probe an existing socket file for a live listener.  connect() succeeding
+ *  (or refusing us for any reason OTHER than ECONNREFUSED/ENOENT) means some
+ *  process still owns the address. */
+function socketHasLiveListener(socketPath: string, timeoutMs = 500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = netConnect(socketPath);
+    const settle = (live: boolean): void => {
+      sock.removeAllListeners();
+      sock.destroy();
+      resolve(live);
+    };
+    sock.setTimeout(timeoutMs, () => settle(true)); // unresponsive but bound: treat as live
+    sock.once('connect', () => settle(true));
+    sock.once('error', (err: NodeJS.ErrnoException) => {
+      // ECONNREFUSED = bound-but-dead, ENOENT = vanished, ENOTSOCK = a plain
+      // file squatting on the path: all provably stale. Anything else (e.g.
+      // EACCES, EAGAIN) errs on the side of "someone owns this".
+      settle(!(err.code === 'ECONNREFUSED' || err.code === 'ENOENT' || err.code === 'ENOTSOCK'));
+    });
+  });
+}
+
 /**
- * Bind on a Unix domain socket: parent dir created 0700, stale socket file
- * unlinked, 'error' listener installed BEFORE listen (an unhandled listener
- * 'error' crashes the process — repo hard-won lesson), socket chmod 0600.
+ * Bind on a Unix domain socket: parent dir created 0700, 'error' listener
+ * installed BEFORE listen (an unhandled listener 'error' crashes the process —
+ * repo hard-won lesson), socket chmod 0600.
+ *
+ * Single-owner guard: an existing socket file is probed first — a LIVE
+ * listener means another sidecar owns this address and startup FAILS HARD
+ * (silently unlinking would steal the address while the old process keeps
+ * driving its runs, breaking cancel and the single-runtime-loop journal
+ * serialization).  Only a provably stale socket (ECONNREFUSED/ENOENT) is
+ * unlinked.
  */
 export async function listenOnSocket(server: Server, socketPath: string): Promise<void> {
   const dir = dirname(socketPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (existsSync(socketPath)) {
+    if (await socketHasLiveListener(socketPath)) {
+      throw new Error(
+        `agent-sidecar: another process is already listening on ${socketPath} — refusing to steal the address`,
+      );
+    }
     try {
       unlinkSync(socketPath);
     } catch { /* a real conflict resurfaces as a listen error below */ }

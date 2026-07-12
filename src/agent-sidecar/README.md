@@ -11,7 +11,7 @@
 
 - 协议常量：`BOTMUX_GOAL_PROTOCOL = 'botmux-goal-v1'`，URL 前缀 `/v1/`。
 - **v1 能力声明恒为 `{ input: false, human: false }`**：不提供 `POST /runs/:id/input`；ASK_HUMAN 只作为结构化非成功证据回传（见 §6），永不映射为 motivation escalation。
-- 传输：Unix domain socket（本机），HTTP/1.1，raw `node:http`。socket 默认 `~/.botmux/agent-sidecar.sock`，父目录 mode 0700；启动时 unlink 陈旧 socket。v1 无 token 鉴权（UDS 文件权限即信任面；如未来走 loopback TCP 必须加独立 token，沿 botmux `daemon-internal-auth.ts` 全信封 HMAC 惯例）。
+- 传输：Unix domain socket（本机），HTTP/1.1，raw `node:http`。socket 默认 `~/.botmux/agent-sidecar.sock`，父目录 mode 0700；启动时先探测既有 socket：**活 listener → 拒绝启动（绝不夺址）**，仅对可证 stale（ECONNREFUSED/ENOENT/ENOTSOCK）unlink——单一属主是 journal 串行化与 cancel 可达性的前提。v1 无 token 鉴权（UDS 文件权限即信任面；如未来走 loopback TCP 必须加独立 token，沿 botmux `daemon-internal-auth.ts` 全信封 HMAC 惯例）。
 
 ## 1. 端点总览
 
@@ -37,9 +37,16 @@ export interface SidecarRunRequest {
   runId: string;        // idempotency key, ^[A-Za-z0-9][A-Za-z0-9._-]{7,63}$
   requestHash: string;  // sha256 hex over canonicalJson(request minus requestHash)
   profileRef: string;   // node-local profile name; NEVER credentials
-  goal: string;         // fully rendered instruction text (caller folds context in)
+  goal: string;         // fully rendered instruction text (caller folds context in).
+                        // Persisted VERBATIM in the run ledger: callers must not
+                        // embed secrets in goal text (see §4 note on secrets scope).
   cwd: string;          // must resolve inside sidecar's allowed workspace roots
   timeoutMs: number;    // hard wall-clock limit for the run
+  /** Execution mode. v1 accepts ONLY 'discovery' and enforces it at admission:
+   * the resolved profile must be discovery-safe (sandbox=true AND
+   * sandboxNetwork=false AND disableCliBypass=true) or the run is rejected
+   * with 403 PROFILE_NOT_DISCOVERY_SAFE. Hash-covered like every other field. */
+  mode: 'discovery';
   taskId?: string;      // opaque caller identity passthrough (journal/display only)
   threadId?: string;    // opaque caller identity passthrough
 }
@@ -118,7 +125,7 @@ export interface SidecarErrorBody {
 }
 ```
 
-错误码（`SidecarErrorBody.error.code`）：`UNKNOWN_RUN`(404) / `IDEMPOTENCY_CONFLICT`(409) / `HASH_MISMATCH`(400，客户端提交的 requestHash 与服务端重算不符) / `MALFORMED_REQUEST`(400) / `UNKNOWN_PROFILE`(400) / `PROFILE_NOT_SANDBOXED`(403) / `CWD_NOT_ALLOWED`(403) / `INTERNAL`(500)。
+错误码（`SidecarErrorBody.error.code`）：`UNKNOWN_RUN`(404) / `IDEMPOTENCY_CONFLICT`(409) / `HASH_MISMATCH`(400，客户端提交的 requestHash 与服务端重算不符) / `MALFORMED_REQUEST`(400) / `UNKNOWN_PROFILE`(400) / `PROFILE_NOT_SANDBOXED`(403) / `PROFILE_NOT_DISCOVERY_SAFE`(403，profile 缺 sandboxNetwork=false 或 disableCliBypass=true) / `CWD_NOT_ALLOWED`(403) / `INTERNAL`(500)。
 
 ## 3. canonical request hash（双仓必须逐字节一致）
 
@@ -133,15 +140,16 @@ export interface SidecarErrorBody {
 
 ```
 fixture1 = { protocol:'botmux-goal-v1', runId:'run-0001-e2e', profileRef:'sandbox-claude',
-             goal:'Write a haiku about idempotency into out.md', cwd:'/tmp/ws/demo', timeoutMs:600000 }
-canonical(fixture1) = {"cwd":"/tmp/ws/demo","goal":"Write a haiku about idempotency into out.md","profileRef":"sandbox-claude","protocol":"botmux-goal-v1","runId":"run-0001-e2e","timeoutMs":600000}
-sha256(fixture1)    = c3c7525d6e1bd843b8f113c853dfd4d2d4b5ad0a405046a4d1a8ef34628f94a4
+             goal:'Write a haiku about idempotency into out.md', cwd:'/tmp/ws/demo', timeoutMs:600000,
+             mode:'discovery' }
+canonical(fixture1) = {"cwd":"/tmp/ws/demo","goal":"Write a haiku about idempotency into out.md","mode":"discovery","profileRef":"sandbox-claude","protocol":"botmux-goal-v1","runId":"run-0001-e2e","timeoutMs":600000}
+sha256(fixture1)    = a591a05407c2113911a7c647949342c6e9c4baf3e1d3133800a71815c6c25490
 
 fixture2 = fixture1 with goal += ' (changed)'
-sha256(fixture2)    = e1263de1d63bd45a16c6690585b10543aad5b496779987f697cff31acead3e77
+sha256(fixture2)    = 2147c1a7eb21c74e410610f26cfd1c250142d40688e746625c3908a43a6ab746
 
 fixture3 = fixture1 + { taskId:'task-42', threadId:'thread-7' }   // 身份字段参与 hash
-sha256(fixture3)    = 1722dd9e3e6086ddbcdcba48b34d25581536a604abe902a0892b17aa439e2f7c
+sha256(fixture3)    = 50264ec35037e92c0dd5d4b4887e3b6d41696906ff2bf15053735180023e1eb5
 ```
 
 语义：服务端**总是重算** hash——与客户端提交值不符 → 400 `HASH_MISMATCH`；runId 已存在时与 ledger 中 `request.json` 的 hash 比对：一致 → attach（200），不一致 → 409 `IDEMPOTENCY_CONFLICT`。
@@ -162,7 +170,7 @@ sha256(fixture3)    = 1722dd9e3e6086ddbcdcba48b34d25581536a604abe902a0892b17aa43
 2. **terminal-before-ack**：`terminal.json` 原子落盘之前，`/result` 只能回 202、events 流不得发 `terminal` 帧；
 3. **journal 终态 → terminal.json 可幂等重建**：进程在「journal 已终态、terminal.json 未写」窗口崩溃后，重启的 finalize 必须产出同一逻辑终态（同 state/同 error code；ts 类字段除外），**绝不产生第二个逻辑终态**；
 4. **lease fencing（本机版）**：`lease.json` 内 pid 存活 → attach 不 re-drive（不双跑）；pid 已死且 journal 未终态 → attach 触发 re-drive（v3 journal 重放天然跳过已完成节点，新 attempt 是重试而非重复执行）；
-5. secrets **永不落 ledger**：`request.json` 无凭证字段；BotSnapshot 落盘沿 botmux 既有契约省略 `larkAppSecret`；goal 经文件传递不进 argv。
+5. **sidecar 侧凭证与 launch env 永不落 ledger**：`request.json` 无凭证字段；BotSnapshot 落盘沿 botmux 既有契约省略 `larkAppSecret`；goal 经文件传递不进 argv。**范围澄清（诚实边界）**：`goal` 文本按原样持久化于 `request.json` 与 goal.txt——调用方（motivation 会把 supervisor context 折进 goal）**不得在 goal 中携带 secret**；sidecar 不做（也无法做）语义级 secret 识别/擦除。
 
 ## 5. 事件流（seq cursor 重放）
 
@@ -186,16 +194,18 @@ sha256(fixture3)    = 1722dd9e3e6086ddbcdcba48b34d25581536a604abe902a0892b17aa43
 ## 8. cost 语义（诚实优先）
 
 - sidecar 是 cost 采集 owner：终态后、teardown 前，按冻结在 ledger 里的 `(cliId, sessionId, cwd)` fold CLI 原生 transcript（claude 族：确定性 `--session-id`、`~/.claude/projects/<realpath(cwd) sanitized>/<sessionId>.jsonl`），产出 4-bucket token usage。
-- `costComplete = usage 完整采集成功 && 归一化 usd 已知`。**v1 生产装配恒为 false**（botmux 无定价表；usd 字段缺省不填）——这就是「成本门未过」的诚实暴露，测试经注入 fake collector 覆盖 true 分支。
+- 采集范围 = **整个 run 的全部 attempt session**（journal `nodeSessionReady` 真相，retry 的花费也是本 run 的花费），collector 必须跨 attempt 聚合。
+- `costComplete` 的**记录级 gate 由 sidecar own**（collector 声明不足信）：四个 token bucket 与 `usd` 全部存在、有限、非负才可为 true——collector 谎报 true 而缺 usd 的记录会被钉回 false（canonical owner 不产出自相矛盾记录）。**v1 生产装配恒为 false**（botmux 无定价表；usd 字段缺省不填）——这就是「成本门未过」的诚实暴露，测试经注入 fake collector 覆盖 true 分支。
 - **禁止**：usage 采集失败时编造 0；`usd:0` 冒充已计费；costComplete=false 的 runtime 进自动候选池。
 - motivation 适配器：`costComplete=false` → **不发 cost 事件**（宁缺毋假，避免污染 append-only 的 run.cost 聚合），usage 以 log 事件形式留观测痕迹。
 
 ## 9. 安全门（v1 结构性拒绝面）
 
-1. sidecar 侧：profileRef 解析出的 BotSnapshot **必须 `sandbox=true`**，否则 403 `PROFILE_NOT_SANDBOXED`（物理沙箱是 spike 运行前提，但**不等于**满足 motivation 的 preSideEffect 契约——不得声称生产安全）；`disableCliBypass` 透传永不清除。
+1. sidecar 侧（v1 只收 `mode:'discovery'`，enforcement 在**执行边界**而非仅调用方）：profileRef 解析出的 BotSnapshot **必须 `sandbox=true`**，否则 403 `PROFILE_NOT_SANDBOXED`；且必须 **discovery-safe：`sandboxNetwork=false`（bwrap 断网=物理无外发）+ `disableCliBypass=true`（不可提权红线）**，否则 403 `PROFILE_NOT_DISCOVERY_SAFE`。注意：这仍不等于 motivation 的 preSideEffect 逐调用契约（物理沙箱是 spike 运行前提，但**不等于**满足 motivation 的 preSideEffect 契约——不得声称生产安全）；`disableCliBypass` 透传永不清除。
 2. sidecar 侧：`cwd` realpath 必须落在 `allowedWorkspaceRoots` 内（默认空=全拒），否则 403 `CWD_NOT_ALLOWED`；symlink 逃逸按 realpath 判。
 3. motivation 侧：`BotmuxGoalExecutorAdapter.preSideEffect` **抛异常**（fail-closed；本 runtime 无逐调用 seam，任何对它的调用都是装配错误）；`run()` 对 `mode==='execute'` 同步抛错拒绝；adapter 不注册进 resolver/fleet-sync/candidate 路径（独立 composition root 结构性不可达）。
-4. Manifest 校验（botmux 既有 validator）：路径 containment、绝对路径拒绝、sha256/bytes/mime 核验；未过校验 → artifacts=[]、state 按 manifestInvalid 处理，**不发布任何 artifact**。
+4. **单一属主**：启动绑定前探测既有 socket，活 listener 拒绝启动（见 §0）——防第二进程夺址后旧 run 失去 cancel 可达性。
+5. Manifest 校验（botmux 既有 validator）：路径 containment、绝对路径拒绝、sha256/bytes/mime 核验；未过校验 → artifacts=[]、state 按 manifestInvalid 处理，**不发布任何 artifact**。
 
 ## 10. 验收矩阵（两仓 contract tests 的最低覆盖；全自动化，不靠人工日志）
 
@@ -217,3 +227,8 @@ sha256(fixture3)    = 1722dd9e3e6086ddbcdcba48b34d25581536a604abe902a0892b17aa43
 | A14 | 未知 runId（events/result/cancel） | 404 UNKNOWN_RUN |
 | A15 | secrets 扫描 | ledger/argv/wire/日志内无凭证（以 marker 值注入断言） |
 | A16 | 黄金向量 §3 | 两仓 hash 字面值一致 |
+| A17 | mode 缺失/非 discovery | 400 MALFORMED_REQUEST，不触发执行 |
+| A18 | sandbox 开但网开 / bypass 未武装 | 403 PROFILE_NOT_DISCOVERY_SAFE，门先于账本 |
+| A19 | collector 谎报 costComplete=true 无 usd（或 usd 非有限/负） | 记录级 gate 钉回 false |
+| A20 | 活 socket 上二次启动 | 硬失败不夺址；旧 server 照常服务、活 run 可 cancel |
+| A21 | 多 attempt run | collector 收到全部 attempt session 并聚合 |

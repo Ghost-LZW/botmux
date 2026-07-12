@@ -20,12 +20,13 @@ const FIXTURE1 = {
   goal: 'Write a haiku about idempotency into out.md',
   cwd: '/tmp/ws/demo',
   timeoutMs: 600000,
+  mode: 'discovery',
 };
 
 describe('canonicalJson', () => {
   it('键按 UTF-16 code unit 升序、无空白、undefined 整体省略', () => {
     expect(canonicalJson(FIXTURE1)).toBe(
-      '{"cwd":"/tmp/ws/demo","goal":"Write a haiku about idempotency into out.md","profileRef":"sandbox-claude","protocol":"botmux-goal-v1","runId":"run-0001-e2e","timeoutMs":600000}',
+      '{"cwd":"/tmp/ws/demo","goal":"Write a haiku about idempotency into out.md","mode":"discovery","profileRef":"sandbox-claude","protocol":"botmux-goal-v1","runId":"run-0001-e2e","timeoutMs":600000}',
     );
     expect(canonicalJson({ b: 1, a: undefined, c: 'x' })).toBe('{"b":1,"c":"x"}');
   });
@@ -43,19 +44,19 @@ describe('canonicalJson', () => {
 describe('canonicalRequestHash — 黄金向量 (A16)', () => {
   it('fixture1', () => {
     expect(canonicalRequestHash(FIXTURE1)).toBe(
-      'c3c7525d6e1bd843b8f113c853dfd4d2d4b5ad0a405046a4d1a8ef34628f94a4',
+      'a591a05407c2113911a7c647949342c6e9c4baf3e1d3133800a71815c6c25490',
     );
   });
 
   it('fixture2 = fixture1 + goal 变更', () => {
     expect(canonicalRequestHash({ ...FIXTURE1, goal: FIXTURE1.goal + ' (changed)' })).toBe(
-      'e1263de1d63bd45a16c6690585b10543aad5b496779987f697cff31acead3e77',
+      '2147c1a7eb21c74e410610f26cfd1c250142d40688e746625c3908a43a6ab746',
     );
   });
 
   it('fixture3 = fixture1 + 身份字段（taskId/threadId 参与 hash）', () => {
     expect(canonicalRequestHash({ ...FIXTURE1, taskId: 'task-42', threadId: 'thread-7' })).toBe(
-      '1722dd9e3e6086ddbcdcba48b34d25581536a604abe902a0892b17aa439e2f7c',
+      '50264ec35037e92c0dd5d4b4887e3b6d41696906ff2bf15053735180023e1eb5',
     );
   });
 

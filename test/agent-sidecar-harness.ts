@@ -150,6 +150,7 @@ export function buildRunBody(partial: {
     goal: partial.goal,
     cwd: partial.cwd,
     timeoutMs: partial.timeoutMs ?? 60_000,
+    mode: 'discovery' as const,
     ...(partial.taskId !== undefined ? { taskId: partial.taskId } : {}),
     ...(partial.threadId !== undefined ? { threadId: partial.threadId } : {}),
   };
@@ -218,16 +219,34 @@ export interface Stack {
 }
 
 export const DEFAULT_PROFILES: Record<string, BotSnapshot> = {
+  // discovery-safe：sandbox + 断网 + 不可提权红线全亮
   'sandbox-claude': {
     larkAppId: 'cli_test_app',
     cliId: 'claude-code',
     sandbox: true,
+    sandboxNetwork: false,
     disableCliBypass: true,
     workingDir: '/tmp',
   },
   'no-sandbox': {
     larkAppId: 'cli_test_app',
     cliId: 'claude-code',
+    workingDir: '/tmp',
+  },
+  // 有沙箱但网络出口仍开 → 非 discovery-safe
+  'sandbox-net-on': {
+    larkAppId: 'cli_test_app',
+    cliId: 'claude-code',
+    sandbox: true,
+    disableCliBypass: true,
+    workingDir: '/tmp',
+  },
+  // 沙箱+断网但未武装 bypass 红线 → 非 discovery-safe
+  'sandbox-bypassable': {
+    larkAppId: 'cli_test_app',
+    cliId: 'claude-code',
+    sandbox: true,
+    sandboxNetwork: false,
     workingDir: '/tmp',
   },
 };

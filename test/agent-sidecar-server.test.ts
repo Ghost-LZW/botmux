@@ -201,6 +201,43 @@ describe('POST /v1/runs — create-or-attach', () => {
       await stack.close();
     }
   });
+
+  it('discovery-safe 门：有沙箱但网开 / bypass 未武装 → 403 PROFILE_NOT_DISCOVERY_SAFE', async () => {
+    const stack = await makeStack({ runNode: okRunNode() });
+    try {
+      for (const [runId, profileRef] of [
+        ['run-dsafe-neton1', 'sandbox-net-on'],
+        ['run-dsafe-bypass', 'sandbox-bypassable'],
+      ] as const) {
+        const r = await wire(stack.socketPath, 'POST', '/v1/runs',
+          buildRunBody({ runId, goal: 'g', cwd: stack.cwd, profileRef }));
+        expect(r.status, profileRef).toBe(403);
+        expect(JSON.parse(r.text).error.code, profileRef).toBe('PROFILE_NOT_DISCOVERY_SAFE');
+        expect(existsSync(join(stack.runsRoot, runId)), profileRef).toBe(false); // 门先于账本
+      }
+      expect(stack.runNodeCalls()).toBe(0);
+    } finally {
+      await stack.close();
+    }
+  });
+
+  it('mode 缺失或非 discovery → 400 MALFORMED_REQUEST（v1 只收 discovery）', async () => {
+    const stack = await makeStack({ runNode: okRunNode() });
+    try {
+      const good = buildRunBody({ runId: 'run-mode-miss1', goal: 'g', cwd: stack.cwd });
+      const { mode: _m, ...withoutMode } = good as any;
+      const r1 = await wire(stack.socketPath, 'POST', '/v1/runs', withoutMode);
+      expect(r1.status).toBe(400);
+      expect(JSON.parse(r1.text).error.code).toBe('MALFORMED_REQUEST');
+
+      const r2 = await wire(stack.socketPath, 'POST', '/v1/runs', { ...good, mode: 'execute' });
+      expect(r2.status).toBe(400);
+      expect(JSON.parse(r2.text).error.code).toBe('MALFORMED_REQUEST');
+      expect(stack.runNodeCalls()).toBe(0);
+    } finally {
+      await stack.close();
+    }
+  });
 });
 
 describe('GET /v1/runs/:id/events', () => {
@@ -384,6 +421,29 @@ describe('UDS socket 行为', () => {
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
       rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('单一属主：活 socket 上的第二次启动硬失败，不夺址；旧 server 照常服务与 cancel', async () => {
+    const stack = await makeStack({ runNode: hangUntilAbortRunNode() });
+    const body = buildRunBody({ runId: 'run-owner-0001', goal: 'g', cwd: stack.cwd });
+    const usurper = createServer(() => {});
+    try {
+      await wire(stack.socketPath, 'POST', '/v1/runs', body); // 旧进程驱动一个活 run
+
+      // 第二个 server 试图绑同一 socket → 拒绝启动（绝不 unlink 活地址）
+      await expect(listenOnSocket(usurper, stack.socketPath)).rejects.toThrow(/already listening/);
+
+      // 旧 server 未被打扰：health 正常，活 run 仍可被 cancel 并收敛 cancelled
+      const health = await wire(stack.socketPath, 'GET', '/v1/health');
+      expect(health.status).toBe(200);
+      const c = await wire(stack.socketPath, 'POST', `/v1/runs/${body.runId}/cancel`);
+      expect([200, 202]).toContain(c.status);
+      const { record } = await awaitTerminal(stack.socketPath, body.runId);
+      expect(record.state).toBe('cancelled');
+    } finally {
+      await new Promise<void>((r) => usurper.close(() => r()));
+      await stack.close();
     }
   });
 });

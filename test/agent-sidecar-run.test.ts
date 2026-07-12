@@ -281,7 +281,7 @@ describe('A11 — usage 采集诚实性', () => {
 
   it('非 claude 家族 CLI → costComplete=false', () => {
     const collect = createClaudeUsageCollector({ claudeDataDir: '/nonexistent' });
-    expect(collect({ cliId: 'codex', sessionId: 's', cwd: '/tmp' })).toEqual({ costComplete: false });
+    expect(collect([{ cliId: 'codex', sessionId: 's', cwd: '/tmp' }])).toEqual({ costComplete: false });
   });
 
   it('fake collector 才能走 costComplete=true 分支（测试注入）', async () => {
@@ -300,6 +300,111 @@ describe('A11 — usage 采集诚实性', () => {
       expect(record.usage.usd).toBe(0.42);
     } finally {
       await stack.close();
+    }
+  });
+
+  it('collector 谎报 costComplete=true 但无 usd → 记录级 gate 钉回 false', async () => {
+    const stack = await makeStack({
+      runNode: okRunNode(),
+      collectUsage: () => ({
+        usage: { model: 'liar', inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 1 },
+        costComplete: true, // 违约声明：wire 契约要求 true 必须带归一化 usd
+      }),
+    });
+    const body = buildRunBody({ runId: 'run-a11-liar1', goal: 'g', cwd: stack.cwd });
+    try {
+      await wire(stack.socketPath, 'POST', '/v1/runs', body);
+      const { record } = await awaitTerminal(stack.socketPath, body.runId);
+      expect(record.costComplete).toBe(false); // canonical owner 不产出自相矛盾记录
+      expect(record.usage).toMatchObject({ model: 'liar' }); // usage 本身仍如实保留
+    } finally {
+      await stack.close();
+    }
+  });
+
+  it('usd 非有限/负数同样钉回 false', async () => {
+    for (const usd of [Number.NaN, -0.01]) {
+      const stack = await makeStack({
+        runNode: okRunNode(),
+        collectUsage: () => ({
+          usage: { model: 'm', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 1, usd },
+          costComplete: true,
+        }),
+      });
+      const body = buildRunBody({ runId: `run-a11-bad${usd < 0 ? 'neg' : 'nan'}`, goal: 'g', cwd: stack.cwd });
+      try {
+        await wire(stack.socketPath, 'POST', '/v1/runs', body);
+        const { record } = await awaitTerminal(stack.socketPath, body.runId);
+        expect(record.costComplete, String(usd)).toBe(false);
+      } finally {
+        await stack.close();
+      }
+    }
+  });
+
+  it('usage 采集范围 = 全部 attempt session（retry 的花费也是本 run 的花费）', async () => {
+    // 多 attempt 的账本：journal 里两条 nodeSessionReady（s1 重试后 s2），
+    // finalize 必须把两个 session 都交给 collector 聚合。
+    const seen: string[][] = [];
+    const stack = await makeStack({
+      runNode: okRunNode(),
+      collectUsage: (sessions) => {
+        seen.push(sessions.map((s) => s.sessionId));
+        return { costComplete: false };
+      },
+    });
+    const runId = 'run-a11-multi1';
+    const body = buildRunBody({ runId, goal: 'g', cwd: stack.cwd });
+    try {
+      stack.store.writeRequest(body);
+      stack.store.writeSession(runId, { cliId: 'claude-code', sessionId: 'sess-frozen', cwd: stack.cwd });
+      const journalPath = stack.store.journalPath(runId);
+      appendEvent(journalPath, { type: 'runStarted', runId });
+      appendEvent(journalPath, { type: 'nodeDispatched', nodeId: 'goal', instanceId: 'goal#001', attemptId: 'goal#001/attempts/001' });
+      appendEvent(journalPath, { type: 'nodeSessionReady', nodeId: 'goal', instanceId: 'goal#001', attemptId: 'goal#001/attempts/001', sessionInfo: { sessionId: 'sess-attempt-1' } });
+      appendEvent(journalPath, { type: 'nodeFailed', nodeId: 'goal', instanceId: 'goal#001', attemptId: 'goal#001/attempts/001', errorClass: 'workerError' });
+      appendEvent(journalPath, { type: 'nodeRetryRequested', nodeId: 'goal', instanceId: 'goal#001', previousAttemptId: 'goal#001/attempts/001', nextAttemptId: 'goal#001/attempts/002', reason: 'blockedRetry' });
+      appendEvent(journalPath, { type: 'nodeSessionReady', nodeId: 'goal', instanceId: 'goal#001', attemptId: 'goal#001/attempts/002', sessionInfo: { sessionId: 'sess-attempt-2' } });
+      appendEvent(journalPath, { type: 'nodeFailed', nodeId: 'goal', instanceId: 'goal#001', attemptId: 'goal#001/attempts/002', errorClass: 'workerError' });
+      appendEvent(journalPath, { type: 'runFailed', failedNodeId: 'goal' });
+
+      const { record } = await awaitTerminal(stack.socketPath, runId);
+      expect(record.state).toBe('failed');
+      expect(seen).toEqual([['sess-attempt-1', 'sess-attempt-2']]); // journal 真相，全量按序
+      expect(record.sessionId).toBe('sess-attempt-2'); // 对外 session = 最后一个 attempt
+    } finally {
+      await stack.close();
+    }
+  });
+
+  it('createClaudeUsageCollector 跨 attempt 聚合；缺一个 transcript 仍如实报部分 usage', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'bmx-as-claude3-'));
+    try {
+      const cwd = mkdtempSync(join(tmpdir(), 'bmx-as-cwd3-'));
+      const projectKey = realpathSync(cwd).replace(/[^A-Za-z0-9-]/g, '-');
+      const transcriptDir = join(dataDir, 'projects', projectKey);
+      mkdirSync(transcriptDir, { recursive: true });
+      const line = (id: string, inTok: number, outTok: number): string =>
+        JSON.stringify({ type: 'assistant', message: { id, model: 'claude-sonnet-4-5', usage: { input_tokens: inTok, output_tokens: outTok, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } });
+      writeFileSync(join(transcriptDir, 'sess-a.jsonl'), line('m1', 10, 5) + '\n');
+      writeFileSync(join(transcriptDir, 'sess-b.jsonl'), line('m2', 7, 3) + '\n');
+
+      const collect = createClaudeUsageCollector({ claudeDataDir: dataDir });
+      const both = collect([
+        { cliId: 'claude-code', sessionId: 'sess-a', cwd },
+        { cliId: 'claude-code', sessionId: 'sess-b', cwd },
+      ]) as { usage?: any; costComplete: boolean };
+      expect(both.usage).toMatchObject({ inputTokens: 17, outputTokens: 8, turns: 2 });
+      expect(both.costComplete).toBe(false);
+
+      const partial = collect([
+        { cliId: 'claude-code', sessionId: 'sess-a', cwd },
+        { cliId: 'claude-code', sessionId: 'sess-missing', cwd },
+      ]) as { usage?: any; costComplete: boolean };
+      expect(partial.usage).toMatchObject({ inputTokens: 10, outputTokens: 5, turns: 1 }); // 部分如实
+      expect(partial.costComplete).toBe(false);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
     }
   });
 });
@@ -337,7 +442,7 @@ describe('A15 — secrets 扫描', () => {
       // goal 走文件不走 argv；request.json 里也不允许出现凭证字段
       const requestJson = JSON.parse(readFileSync(join(stack.runsRoot, body.runId, 'request.json'), 'utf-8'));
       expect(Object.keys(requestJson).sort()).toEqual(
-        ['cwd', 'goal', 'profileRef', 'protocol', 'requestHash', 'runId', 'timeoutMs'],
+        ['cwd', 'goal', 'mode', 'profileRef', 'protocol', 'requestHash', 'runId', 'timeoutMs'],
       );
     } finally {
       await stack.close();

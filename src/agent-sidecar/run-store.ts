@@ -52,11 +52,31 @@ export interface CancelMarker {
   requestedAt: number;
 }
 
-/** Best-effort per-run usage collection after terminal (spec §8).  Real wiring
- *  never knows usd → costComplete always false; tests inject a fake. */
+/** Best-effort per-run usage collection after terminal (spec §8).  Receives
+ *  ONE FrozenSession per attempt of the run (same cliId/cwd, per-attempt
+ *  sessionId — derived from the journal's nodeSessionReady lines, frozen
+ *  anchor as the pre-spawn fallback) and must aggregate across ALL of them:
+ *  a retry's usage is part of the run's cost.  Real wiring never knows usd →
+ *  costComplete always false; tests inject a fake. */
 export type CollectUsage = (
-  frozen: FrozenSession,
+  sessions: FrozenSession[],
 ) => { usage?: SidecarUsage; costComplete: boolean } | Promise<{ usage?: SidecarUsage; costComplete: boolean }>;
+
+/** costComplete may be attested by a collector, but the RECORD-level gate is
+ *  owned here (wire contract: true ONLY if usage is fully collected AND a
+ *  normalized usd is present): all four token buckets and usd must be finite
+ *  and non-negative, else the record says false regardless of the collector. */
+export function usageSatisfiesCostComplete(usage: SidecarUsage | undefined): boolean {
+  if (!usage) return false;
+  const finiteNonNeg = (n: unknown): boolean => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+  return (
+    finiteNonNeg(usage.inputTokens) &&
+    finiteNonNeg(usage.outputTokens) &&
+    finiteNonNeg(usage.cacheReadTokens) &&
+    finiteNonNeg(usage.cacheCreationTokens) &&
+    finiteNonNeg(usage.usd)
+  );
+}
 
 export function defaultRunsRoot(env: NodeJS.ProcessEnv = process.env): string {
   return env.BOTMUX_AGENT_RUNS_DIR || join(homedir(), '.botmux', 'agent-runs');
@@ -268,19 +288,27 @@ export async function finalizeRun(
   // the pre-spawn fallback.  Never webPort/token — the journal already omits
   // the token and we drop webPort here.
   const frozen = store.readSession(runId);
-  let sessionId: string | undefined;
+  const attemptSessionIds: string[] = [];
   for (const e of events) {
-    if (e.type === 'nodeSessionReady') sessionId = e.sessionInfo.sessionId;
+    if (e.type === 'nodeSessionReady' && !attemptSessionIds.includes(e.sessionInfo.sessionId)) {
+      attemptSessionIds.push(e.sessionInfo.sessionId);
+    }
   }
-  sessionId = sessionId ?? frozen?.sessionId;
+  const sessionId = attemptSessionIds[attemptSessionIds.length - 1] ?? frozen?.sessionId;
 
+  // Cost scope = the WHOLE run: one FrozenSession per attempt (a retry's
+  // usage is still this run's spend).  The record-level costComplete gate is
+  // usageSatisfiesCostComplete — a collector cannot attest completeness for a
+  // record with missing/non-finite buckets or absent usd (wire contract §8).
   let usage: SidecarUsage | undefined;
   let costComplete = false;
   if (deps.collectUsage && frozen) {
+    const sessions: FrozenSession[] = (attemptSessionIds.length > 0 ? attemptSessionIds : [frozen.sessionId])
+      .map((sid) => ({ cliId: frozen.cliId, cwd: frozen.cwd, sessionId: sid }));
     try {
-      const collected = await deps.collectUsage(frozen);
+      const collected = await deps.collectUsage(sessions);
       usage = collected.usage;
-      costComplete = collected.costComplete === true && collected.usage !== undefined;
+      costComplete = collected.costComplete === true && usageSatisfiesCostComplete(collected.usage);
     } catch {
       // Honest cost stance: collection failure → absent usage, never zeros.
     }

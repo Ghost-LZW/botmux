@@ -25,9 +25,16 @@ export interface SidecarRunRequest {
   runId: string;        // idempotency key, ^[A-Za-z0-9][A-Za-z0-9._-]{7,63}$
   requestHash: string;  // sha256 hex over canonicalJson(request minus requestHash)
   profileRef: string;   // node-local profile name; NEVER credentials
-  goal: string;         // fully rendered instruction text (caller folds context in)
+  goal: string;         // fully rendered instruction text (caller folds context in).
+                        // Persisted VERBATIM in the run ledger: callers must not
+                        // embed secrets in goal text (see §4 note on secrets scope).
   cwd: string;          // must resolve inside sidecar's allowed workspace roots
   timeoutMs: number;    // hard wall-clock limit for the run
+  /** Execution mode. v1 accepts ONLY 'discovery' and enforces it at admission:
+   * the resolved profile must be discovery-safe (sandbox=true AND
+   * sandboxNetwork=false AND disableCliBypass=true) or the run is rejected
+   * with 403 PROFILE_NOT_DISCOVERY_SAFE. Hash-covered like every other field. */
+  mode: 'discovery';
   taskId?: string;      // opaque caller identity passthrough (journal/display only)
   threadId?: string;    // opaque caller identity passthrough
 }
@@ -113,6 +120,7 @@ export const SIDECAR_ERROR_CODES = {
   MALFORMED_REQUEST: 400,
   UNKNOWN_PROFILE: 400,
   PROFILE_NOT_SANDBOXED: 403,
+  PROFILE_NOT_DISCOVERY_SAFE: 403,
   CWD_NOT_ALLOWED: 403,
   INTERNAL: 500,
 } as const;
