@@ -6853,6 +6853,13 @@ switch (command) {
     await cmdV3(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
+  case 'agent-sidecar': {
+    // botmux-goal-v1 headless single-run sidecar over a Unix domain socket
+    // (independent composition root; see src/agent-sidecar/README.md).
+    const { mainAgentSidecar } = await import('./agent-sidecar/main.js');
+    await mainAgentSidecar(process.argv.slice(3));
+    break;
+  }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
