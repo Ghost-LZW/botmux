@@ -87,6 +87,15 @@ export async function mainAgentSidecar(argv: string[] = []): Promise<void> {
     runNode,
     validateManifest,
     collectUsage: createClaudeUsageCollector(),
+    // v1 fail-closed, NO override: the botmux sandbox still bind-mounts the
+    // daemon-mediated relay outbox (`botmux send` egress via host watcher) and
+    // real auth paths rw, so sandboxNetwork=false does NOT make a run
+    // side-effect-free.  Lifting this requires a sidecar sandbox policy
+    // (no relay outbox/shim, auth read-only) plus Linux runtime negative
+    // tests — a code change by design, not a config flag.
+    realRunsDisabledReason:
+      'v1 sidecar is contract-proof only: real worker runs are disabled until the ' +
+      'sandbox discovery policy closes relay-outbox/auth-write egress (see README section 9)',
     log: (msg) => console.error(msg),
   });
 

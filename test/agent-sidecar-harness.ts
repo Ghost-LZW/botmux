@@ -258,6 +258,7 @@ export async function makeStack(opts: {
   /** 复用既有 runsRoot（模拟 sidecar 重启：同一账本上起新 server/store）。 */
   reuseRunsRoot?: string;
   extraWorkspaceRoots?: string[];
+  realRunsDisabledReason?: string;
 }): Promise<Stack> {
   const root = mkdtempSync(join(tmpdir(), 'bmx-as-'));
   const runsRoot = opts.reuseRunsRoot ?? join(root, 'runs');
@@ -280,6 +281,7 @@ export async function makeStack(opts: {
     runNode: countedRunNode,
     validateManifest: realValidateManifest,
     collectUsage: opts.collectUsage,
+    realRunsDisabledReason: opts.realRunsDisabledReason,
     log: () => {},
   });
   const server = createSidecarServer({ store, driver, followPollMs: 20, log: () => {} });

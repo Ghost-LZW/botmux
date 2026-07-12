@@ -6,8 +6,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer, request as httpRequest } from 'node:http';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -387,26 +388,84 @@ describe('未知 runId — A14', () => {
   });
 });
 
+/** 铸真 stale socket：子进程 listen 成功后 SIGKILL 自杀，socket 文件残留。 */
+function makeCrashedSocket(socketPath: string): void {
+  const r = spawnSync(process.execPath, ['-e',
+    `const net=require('net');const s=net.createServer();s.listen(process.argv[1],()=>{process.kill(process.pid,'SIGKILL')});`,
+    socketPath]);
+  if (!existsSync(socketPath)) {
+    throw new Error(`makeCrashedSocket: no socket file left behind (status=${r.status} signal=${r.signal})`);
+  }
+}
+
 describe('UDS socket 行为', () => {
-  it('父目录 0700、socket 0600、stale socket 启动时 unlink', async () => {
+  it('父目录 0700、socket 0600、真 stale socket（崩溃残留）启动时回收', async () => {
     const base = mkdtempSync(join(tmpdir(), 'bmx-as-uds-'));
     const dir = join(base, 'holder');
     const socketPath = join(dir, 's.sock');
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+    // 铸一个真正的 stale socket：子进程绑定后 SIGKILL 自杀（close 会 unlink，
+    // 崩溃不会）——socket 文件残留 + lock 里留一个必死 pid。
+    makeCrashedSocket(socketPath);
+    writeFileSync(`${socketPath}.lock`, JSON.stringify({ pid: 99999999, startedAt: 0 }));
+
     const server = createServer(() => {});
     try {
-      // 预置 stale socket 文件（上次崩溃残留）
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(socketPath, '');
-      rmSync(dir, { recursive: true, force: true }); // 重建走 mkdir 0700 路径
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-      writeFileSync(socketPath, '');
-
-      await listenOnSocket(server, socketPath);
+      await listenOnSocket(server, socketPath); // 死 pid lock 回收 + stale socket 清理
       expect(statSync(dir).mode & 0o777).toBe(0o700);
       expect(statSync(socketPath).mode & 0o777).toBe(0o600);
       expect(statSync(socketPath).isSocket()).toBe(true);
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('普通文件占位 → 硬失败且绝不删除（非 socket 不是可证 stale）', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'bmx-as-uds3-'));
+    const socketPath = join(base, 'plain.sock');
+    writeFileSync(socketPath, 'i am not a socket');
+    const server = createServer(() => {});
+    try {
+      await expect(listenOnSocket(server, socketPath)).rejects.toThrow(/not a socket/);
+      expect(readFileSync(socketPath, 'utf-8')).toBe('i am not a socket'); // 未被动过
+      expect(existsSync(`${socketPath}.lock`)).toBe(false); // 失败路径释放 lock
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('并发 stale 启动：ownership lock 保证恰好一个赢家，赢家地址不被 unlink', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'bmx-as-uds4-'));
+    const socketPath = join(base, 'race.sock');
+    // 真 stale socket + 死 pid lock（两个竞争者都面对同一残骸）
+    makeCrashedSocket(socketPath);
+    writeFileSync(`${socketPath}.lock`, JSON.stringify({ pid: 99999999, startedAt: 0 }));
+
+    const a = createServer((_req, res) => { res.writeHead(200); res.end('a'); });
+    const b = createServer((_req, res) => { res.writeHead(200); res.end('b'); });
+    try {
+      const results = await Promise.allSettled([
+        listenOnSocket(a, socketPath),
+        listenOnSocket(b, socketPath),
+      ]);
+      const wins = results.filter((r) => r.status === 'fulfilled').length;
+      expect(wins).toBe(1); // 恰好一个成功
+      // 赢家的地址仍然可达（没有被输家 unlink/夺址）
+      const probe = await new Promise<number>((resolve, reject) => {
+        const req = httpRequest({ socketPath, path: '/', method: 'GET' }, (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      expect(probe).toBe(200);
+    } finally {
+      await new Promise<void>((r) => a.close(() => r()));
+      await new Promise<void>((r) => b.close(() => r()));
       rmSync(base, { recursive: true, force: true });
     }
   });
@@ -432,7 +491,7 @@ describe('UDS socket 行为', () => {
       await wire(stack.socketPath, 'POST', '/v1/runs', body); // 旧进程驱动一个活 run
 
       // 第二个 server 试图绑同一 socket → 拒绝启动（绝不 unlink 活地址）
-      await expect(listenOnSocket(usurper, stack.socketPath)).rejects.toThrow(/already listening/);
+      await expect(listenOnSocket(usurper, stack.socketPath)).rejects.toThrow(/refusing to st/); // lock 或活 listener 任一道门
 
       // 旧 server 未被打扰：health 正常，活 run 仍可被 cancel 并收敛 cancelled
       const health = await wire(stack.socketPath, 'GET', '/v1/health');

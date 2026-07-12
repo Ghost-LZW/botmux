@@ -121,6 +121,11 @@ export const SIDECAR_ERROR_CODES = {
   UNKNOWN_PROFILE: 400,
   PROFILE_NOT_SANDBOXED: 403,
   PROFILE_NOT_DISCOVERY_SAFE: 403,
+  /** v1 real composition root refuses ALL real worker runs (fail-closed):
+   * the current botmux sandbox still leaves daemon-mediated egress open
+   * (relay outbox / rw-bound auth paths), so no real execution face may be
+   * exposed until a sidecar sandbox policy closes those channels. */
+  REAL_RUNS_DISABLED: 403,
   CWD_NOT_ALLOWED: 403,
   INTERNAL: 500,
 } as const;

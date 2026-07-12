@@ -17,7 +17,18 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { connect as netConnect } from 'node:net';
-import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
 
 import {
@@ -294,12 +305,64 @@ function socketHasLiveListener(socketPath: string, timeoutMs = 500): Promise<boo
     sock.setTimeout(timeoutMs, () => settle(true)); // unresponsive but bound: treat as live
     sock.once('connect', () => settle(true));
     sock.once('error', (err: NodeJS.ErrnoException) => {
-      // ECONNREFUSED = bound-but-dead, ENOENT = vanished, ENOTSOCK = a plain
-      // file squatting on the path: all provably stale. Anything else (e.g.
-      // EACCES, EAGAIN) errs on the side of "someone owns this".
-      settle(!(err.code === 'ECONNREFUSED' || err.code === 'ENOENT' || err.code === 'ENOTSOCK'));
+      // ECONNREFUSED = bound-but-dead, ENOENT = vanished: provably stale.
+      // Anything else (EACCES, EAGAIN, ENOTSOCK...) errs on "someone owns this"
+      // — non-socket files are rejected by an explicit lstat check upstream,
+      // never deleted.
+      settle(!(err.code === 'ECONNREFUSED' || err.code === 'ENOENT'));
     });
   });
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Atomic ownership lock at `<socketPath>.lock` (O_EXCL create, held for the
+ * server's lifetime).  Serializes the probe→cleanup→bind sequence so two
+ * processes racing the same stale socket cannot both pass the probe and then
+ * unlink each other's fresh bind (TOCTOU).  A lock whose recorded pid is dead
+ * is reclaimed via atomic rename (only ONE contender's rename can succeed;
+ * losers fall back to the O_EXCL retry, which again admits exactly one).
+ */
+function acquireOwnershipLock(socketPath: string): () => void {
+  const lockPath = `${socketPath}.lock`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(lockPath, 'wx', 0o600);
+      writeSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+      closeSync(fd);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        try { unlinkSync(lockPath); } catch { /* already gone */ }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      let owner: { pid?: number } | undefined;
+      try { owner = JSON.parse(readFileSync(lockPath, 'utf-8')) as { pid?: number }; } catch { owner = undefined; }
+      if (owner?.pid && pidAlive(owner.pid)) {
+        throw new Error(
+          `agent-sidecar: ownership lock ${lockPath} held by live pid ${owner.pid} — refusing to start`,
+        );
+      }
+      // Dead/corrupt lock: reclaim by ATOMIC rename (not unlink) so only one
+      // contender wins the reclaim; then retry the O_EXCL create.
+      const tomb = `${lockPath}.stale.${process.pid}`;
+      try {
+        renameSync(lockPath, tomb);
+        unlinkSync(tomb);
+      } catch { /* another contender reclaimed first — retry decides */ }
+    }
+  }
+  throw new Error(`agent-sidecar: could not acquire ownership lock ${lockPath} — refusing to start`);
 }
 
 /**
@@ -307,34 +370,55 @@ function socketHasLiveListener(socketPath: string, timeoutMs = 500): Promise<boo
  * installed BEFORE listen (an unhandled listener 'error' crashes the process —
  * repo hard-won lesson), socket chmod 0600.
  *
- * Single-owner guard: an existing socket file is probed first — a LIVE
- * listener means another sidecar owns this address and startup FAILS HARD
- * (silently unlinking would steal the address while the old process keeps
- * driving its runs, breaking cancel and the single-runtime-loop journal
- * serialization).  Only a provably stale socket (ECONNREFUSED/ENOENT) is
- * unlinked.
+ * Single-owner guard, in order:
+ *   1. acquire the `<socket>.lock` ownership lock (O_EXCL; live holder → hard
+ *      fail) — closes the probe/unlink TOCTOU between concurrent starters;
+ *   2. a non-socket file at socketPath → hard fail, NEVER deleted (a plain
+ *      file is not a provably stale socket);
+ *   3. probe a pre-existing socket: LIVE listener → hard fail (silently
+ *      unlinking would steal the address while the old process keeps driving
+ *      its runs, breaking cancel and journal serialization); only provably
+ *      stale (ECONNREFUSED/ENOENT) sockets are unlinked.
+ * The lock is released when the server closes (or on any startup failure).
  */
 export async function listenOnSocket(server: Server, socketPath: string): Promise<void> {
   const dir = dirname(socketPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (existsSync(socketPath)) {
-    if (await socketHasLiveListener(socketPath)) {
-      throw new Error(
-        `agent-sidecar: another process is already listening on ${socketPath} — refusing to steal the address`,
-      );
+  const releaseLock = acquireOwnershipLock(socketPath);
+  try {
+    if (existsSync(socketPath)) {
+      if (!lstatSync(socketPath).isSocket()) {
+        throw new Error(
+          `agent-sidecar: ${socketPath} exists and is not a socket — refusing to start (will not delete a non-socket file)`,
+        );
+      }
+      if (await socketHasLiveListener(socketPath)) {
+        throw new Error(
+          `agent-sidecar: another process is already listening on ${socketPath} — refusing to steal the address`,
+        );
+      }
+      try {
+        unlinkSync(socketPath);
+      } catch { /* a real conflict resurfaces as a listen error below */ }
     }
-    try {
-      unlinkSync(socketPath);
-    } catch { /* a real conflict resurfaces as a listen error below */ }
+  } catch (err) {
+    releaseLock();
+    throw err;
   }
-  await new Promise<void>((resolve, reject) => {
-    const onError = (err: Error): void => reject(err);
-    server.once('error', onError);
-    server.listen(socketPath, () => {
-      server.removeListener('error', onError);
-      resolve();
+  server.once('close', releaseLock);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onError = (err: Error): void => reject(err);
+      server.once('error', onError);
+      server.listen(socketPath, () => {
+        server.removeListener('error', onError);
+        resolve();
+      });
     });
-  });
+  } catch (err) {
+    releaseLock();
+    throw err;
+  }
   // Keep a persistent handler so a post-listen socket error can't crash us.
   server.on('error', (err) => console.error(`agent-sidecar: server error: ${String(err)}`));
   try {

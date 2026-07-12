@@ -71,6 +71,14 @@ export interface RunDriverDeps {
   runNode: RunNode;
   validateManifest: ValidateManifest;
   collectUsage?: CollectUsage;
+  /** When set, EVERY create/attach admission fails 403 REAL_RUNS_DISABLED with
+   *  this reason.  The v1 REAL composition root sets it unconditionally: the
+   *  current botmux sandbox still leaves daemon-mediated egress open (relay
+   *  outbox `botmux send` via host watcher; rw-bound real auth paths), so the
+   *  profile flags are necessary-but-NOT-sufficient and no real execution
+   *  face may be exposed.  Contract tests inject fake runNodes and leave this
+   *  unset. */
+  realRunsDisabledReason?: string;
   log?: (msg: string) => void;
 }
 
@@ -122,6 +130,9 @@ export function createRunDriver(deps: RunDriverDeps): RunDriver {
 
   /** Spec §9 gates — MUST all pass before any ledger write. */
   const admit = (request: SidecarRunRequest): { snapshot: BotSnapshot; realCwd: string } => {
+    if (deps.realRunsDisabledReason) {
+      throw new SidecarGateError('REAL_RUNS_DISABLED', deps.realRunsDisabledReason);
+    }
     const profile = deps.resolveProfile(request.profileRef);
     if (!profile) {
       throw new SidecarGateError('UNKNOWN_PROFILE', `unknown profile "${request.profileRef}"`);

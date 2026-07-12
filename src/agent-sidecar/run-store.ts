@@ -64,16 +64,23 @@ export type CollectUsage = (
 
 /** costComplete may be attested by a collector, but the RECORD-level gate is
  *  owned here (wire contract: true ONLY if usage is fully collected AND a
- *  normalized usd is present): all four token buckets and usd must be finite
- *  and non-negative, else the record says false regardless of the collector. */
+ *  normalized usd is present): every field of a complete record must be sane —
+ *  token buckets and turns are non-negative integers, usd is finite and
+ *  non-negative, model is a non-empty string.  Anything less (NaN turns would
+ *  persist as null and poison the consumer's CostRecord) keeps the usage for
+ *  observability but pins costComplete to false regardless of the collector. */
 export function usageSatisfiesCostComplete(usage: SidecarUsage | undefined): boolean {
   if (!usage) return false;
+  const intNonNeg = (n: unknown): boolean => typeof n === 'number' && Number.isInteger(n) && n >= 0;
   const finiteNonNeg = (n: unknown): boolean => typeof n === 'number' && Number.isFinite(n) && n >= 0;
   return (
-    finiteNonNeg(usage.inputTokens) &&
-    finiteNonNeg(usage.outputTokens) &&
-    finiteNonNeg(usage.cacheReadTokens) &&
-    finiteNonNeg(usage.cacheCreationTokens) &&
+    typeof usage.model === 'string' &&
+    usage.model !== '' &&
+    intNonNeg(usage.inputTokens) &&
+    intNonNeg(usage.outputTokens) &&
+    intNonNeg(usage.cacheReadTokens) &&
+    intNonNeg(usage.cacheCreationTokens) &&
+    intNonNeg(usage.turns) &&
     finiteNonNeg(usage.usd)
   );
 }

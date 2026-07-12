@@ -8,7 +8,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -322,6 +322,28 @@ describe('A11 — usage 采集诚实性', () => {
     }
   });
 
+  it('turns NaN/负数、model 空串 → 同样钉回 false（NaN 持久化会变 null 毒化消费方）', async () => {
+    const cases = [
+      { label: 'turns-nan', usage: { model: 'm', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, turns: Number.NaN, usd: 0.1 } },
+      { label: 'turns-neg', usage: { model: 'm', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, turns: -1, usd: 0.1 } },
+      { label: 'model-empty', usage: { model: '', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 1, usd: 0.1 } },
+    ];
+    for (const [i, c] of cases.entries()) {
+      const stack = await makeStack({
+        runNode: okRunNode(),
+        collectUsage: () => ({ usage: c.usage as any, costComplete: true }),
+      });
+      const body = buildRunBody({ runId: `run-a11-inv${i}xx`, goal: 'g', cwd: stack.cwd });
+      try {
+        await wire(stack.socketPath, 'POST', '/v1/runs', body);
+        const { record } = await awaitTerminal(stack.socketPath, body.runId);
+        expect(record.costComplete, c.label).toBe(false);
+      } finally {
+        await stack.close();
+      }
+    }
+  });
+
   it('usd 非有限/负数同样钉回 false', async () => {
     for (const usd of [Number.NaN, -0.01]) {
       const stack = await makeStack({
@@ -405,6 +427,27 @@ describe('A11 — usage 采集诚实性', () => {
       expect(partial.costComplete).toBe(false);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('REAL_RUNS_DISABLED — v1 真实组合根 fail-closed', () => {
+  it('realRunsDisabledReason 置位 → create/attach 一律 403，无任何账本写', async () => {
+    const stack = await makeStack({
+      runNode: okRunNode(),
+      realRunsDisabledReason: 'v1 sidecar is contract-proof only (test)',
+    });
+    const body = buildRunBody({ runId: 'run-disabled01', goal: 'g', cwd: stack.cwd });
+    try {
+      for (let i = 0; i < 2; i++) { // create 与重试 attach 同样被拒
+        const res = await wire(stack.socketPath, 'POST', '/v1/runs', body);
+        expect(res.status).toBe(403);
+        expect(JSON.parse(res.text).error.code).toBe('REAL_RUNS_DISABLED');
+      }
+      expect(existsSync(join(stack.runsRoot, body.runId))).toBe(false);
+      expect(stack.runNodeCalls()).toBe(0);
+    } finally {
+      await stack.close();
     }
   });
 });

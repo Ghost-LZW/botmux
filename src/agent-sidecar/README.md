@@ -11,7 +11,7 @@
 
 - 协议常量：`BOTMUX_GOAL_PROTOCOL = 'botmux-goal-v1'`，URL 前缀 `/v1/`。
 - **v1 能力声明恒为 `{ input: false, human: false }`**：不提供 `POST /runs/:id/input`；ASK_HUMAN 只作为结构化非成功证据回传（见 §6），永不映射为 motivation escalation。
-- 传输：Unix domain socket（本机），HTTP/1.1，raw `node:http`。socket 默认 `~/.botmux/agent-sidecar.sock`，父目录 mode 0700；启动时先探测既有 socket：**活 listener → 拒绝启动（绝不夺址）**，仅对可证 stale（ECONNREFUSED/ENOENT/ENOTSOCK）unlink——单一属主是 journal 串行化与 cancel 可达性的前提。v1 无 token 鉴权（UDS 文件权限即信任面；如未来走 loopback TCP 必须加独立 token，沿 botmux `daemon-internal-auth.ts` 全信封 HMAC 惯例）。
+- 传输：Unix domain socket（本机），HTTP/1.1，raw `node:http`。socket 默认 `~/.botmux/agent-sidecar.sock`，父目录 mode 0700。**单一属主协议**：绑定前先以 `<socket>.lock` **O_EXCL ownership lock** 串行化（活 pid 持锁 → 拒绝启动；死 pid 锁经原子 rename 回收），拿锁后普通文件占位 → **硬失败绝不删除**（非 socket 不是可证 stale），既有 socket 活 listener → 拒绝启动（绝不夺址），仅可证 stale（ECONNREFUSED/ENOENT）unlink——单一属主是 journal 串行化与 cancel 可达性的前提，lock 关闭并发 stale 清理的 TOCTOU。v1 无 token 鉴权（UDS 文件权限即信任面；如未来走 loopback TCP 必须加独立 token，沿 botmux `daemon-internal-auth.ts` 全信封 HMAC 惯例）。
 
 ## 1. 端点总览
 
@@ -125,7 +125,7 @@ export interface SidecarErrorBody {
 }
 ```
 
-错误码（`SidecarErrorBody.error.code`）：`UNKNOWN_RUN`(404) / `IDEMPOTENCY_CONFLICT`(409) / `HASH_MISMATCH`(400，客户端提交的 requestHash 与服务端重算不符) / `MALFORMED_REQUEST`(400) / `UNKNOWN_PROFILE`(400) / `PROFILE_NOT_SANDBOXED`(403) / `PROFILE_NOT_DISCOVERY_SAFE`(403，profile 缺 sandboxNetwork=false 或 disableCliBypass=true) / `CWD_NOT_ALLOWED`(403) / `INTERNAL`(500)。
+错误码（`SidecarErrorBody.error.code`）：`UNKNOWN_RUN`(404) / `IDEMPOTENCY_CONFLICT`(409) / `HASH_MISMATCH`(400，客户端提交的 requestHash 与服务端重算不符) / `MALFORMED_REQUEST`(400) / `UNKNOWN_PROFILE`(400) / `PROFILE_NOT_SANDBOXED`(403) / `PROFILE_NOT_DISCOVERY_SAFE`(403，profile 缺 sandboxNetwork=false 或 disableCliBypass=true) / `REAL_RUNS_DISABLED`(403，v1 真实组合根恒开启的 fail-closed 门，见 §9) / `CWD_NOT_ALLOWED`(403) / `INTERNAL`(500)。
 
 ## 3. canonical request hash（双仓必须逐字节一致）
 
@@ -195,13 +195,13 @@ sha256(fixture3)    = 50264ec35037e92c0dd5d4b4887e3b6d41696906ff2bf1505373518002
 
 - sidecar 是 cost 采集 owner：终态后、teardown 前，按冻结在 ledger 里的 `(cliId, sessionId, cwd)` fold CLI 原生 transcript（claude 族：确定性 `--session-id`、`~/.claude/projects/<realpath(cwd) sanitized>/<sessionId>.jsonl`），产出 4-bucket token usage。
 - 采集范围 = **整个 run 的全部 attempt session**（journal `nodeSessionReady` 真相，retry 的花费也是本 run 的花费），collector 必须跨 attempt 聚合。
-- `costComplete` 的**记录级 gate 由 sidecar own**（collector 声明不足信）：四个 token bucket 与 `usd` 全部存在、有限、非负才可为 true——collector 谎报 true 而缺 usd 的记录会被钉回 false（canonical owner 不产出自相矛盾记录）。**v1 生产装配恒为 false**（botmux 无定价表；usd 字段缺省不填）——这就是「成本门未过」的诚实暴露，测试经注入 fake collector 覆盖 true 分支。
+- `costComplete` 的**记录级 gate 由 sidecar own**（collector 声明不足信）：`model` 非空、四个 token bucket 与 `turns` 均为非负整数、`usd` 有限非负，全部满足才可为 true（NaN 经 JSON 持久化变 null 会毒化消费方）——collector 谎报 true 而缺 usd 的记录会被钉回 false（canonical owner 不产出自相矛盾记录）。**v1 生产装配恒为 false**（botmux 无定价表；usd 字段缺省不填）——这就是「成本门未过」的诚实暴露，测试经注入 fake collector 覆盖 true 分支。
 - **禁止**：usage 采集失败时编造 0；`usd:0` 冒充已计费；costComplete=false 的 runtime 进自动候选池。
 - motivation 适配器：`costComplete=false` → **不发 cost 事件**（宁缺毋假，避免污染 append-only 的 run.cost 聚合），usage 以 log 事件形式留观测痕迹。
 
 ## 9. 安全门（v1 结构性拒绝面）
 
-1. sidecar 侧（v1 只收 `mode:'discovery'`，enforcement 在**执行边界**而非仅调用方）：profileRef 解析出的 BotSnapshot **必须 `sandbox=true`**，否则 403 `PROFILE_NOT_SANDBOXED`；且必须 **discovery-safe：`sandboxNetwork=false`（bwrap 断网=物理无外发）+ `disableCliBypass=true`（不可提权红线）**，否则 403 `PROFILE_NOT_DISCOVERY_SAFE`。注意：这仍不等于 motivation 的 preSideEffect 逐调用契约（物理沙箱是 spike 运行前提，但**不等于**满足 motivation 的 preSideEffect 契约——不得声称生产安全）；`disableCliBypass` 透传永不清除。
+1. sidecar 侧（v1 只收 `mode:'discovery'`）：profileRef 解析出的 BotSnapshot **必须 `sandbox=true`**（403 `PROFILE_NOT_SANDBOXED`）且 **`sandboxNetwork=false` + `disableCliBypass=true`**（403 `PROFILE_NOT_DISCOVERY_SAFE`）。**诚实边界：这些 profile 条件是必要不充分**——当前 botmux sandbox 仍把 daemon-mediated relay outbox（`botmux send` 经 host watcher 真实外发）与真实 auth 路径以 rw bind 放进沙箱（`src/adapters/backend/sandbox.ts`），因此**即使断网也不构成"无外发"**，v1 不声明 discovery-safe/零副作用。**因此 v1 真实组合根（main.ts）恒开启 `REAL_RUNS_DISABLED` fail-closed 门：拒绝一切真实 worker run（合同证明只经测试注入的 fake runNode 进行）**；解除该门=代码改动而非配置，前置：sidecar sandbox policy（不 bind relay outbox、不注入 `BOTMUX_SEND_RELAY`/shim、auth 只读或隔离 overlay）+ Linux 运行时负向测试证明 worker 无法外发/写真实资源。这仍不等于 motivation 的 preSideEffect 逐调用契约。
 2. sidecar 侧：`cwd` realpath 必须落在 `allowedWorkspaceRoots` 内（默认空=全拒），否则 403 `CWD_NOT_ALLOWED`；symlink 逃逸按 realpath 判。
 3. motivation 侧：`BotmuxGoalExecutorAdapter.preSideEffect` **抛异常**（fail-closed；本 runtime 无逐调用 seam，任何对它的调用都是装配错误）；`run()` 对 `mode==='execute'` 同步抛错拒绝；adapter 不注册进 resolver/fleet-sync/candidate 路径（独立 composition root 结构性不可达）。
 4. **单一属主**：启动绑定前探测既有 socket，活 listener 拒绝启动（见 §0）——防第二进程夺址后旧 run 失去 cancel 可达性。
@@ -232,3 +232,7 @@ sha256(fixture3)    = 50264ec35037e92c0dd5d4b4887e3b6d41696906ff2bf1505373518002
 | A19 | collector 谎报 costComplete=true 无 usd（或 usd 非有限/负） | 记录级 gate 钉回 false |
 | A20 | 活 socket 上二次启动 | 硬失败不夺址；旧 server 照常服务、活 run 可 cancel |
 | A21 | 多 attempt run | collector 收到全部 attempt session 并聚合 |
+| A22 | v1 真实组合根 | 一切 create/attach → 403 REAL_RUNS_DISABLED，零账本写 |
+| A23 | 两进程并发面对同一 stale socket | ownership lock 保证恰好一个赢家，赢家地址不被 unlink |
+| A24 | 普通文件占位 socket 路径 | 硬失败且文件不被删除 |
+| A25 | usage turns NaN/负 或 model 空 | costComplete 钉回 false |
