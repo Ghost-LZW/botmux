@@ -18,6 +18,8 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
   const settingsView: ResolvedDashboardSettingsView = {
     publicReadOnly: false,
     openTerminalInFeishu: false,
+    enableLocalCliOpen: false,
+    localCliOpenMode: 'attach',
     chatBotDiscovery: true,
     vcMeetingAgent: { enabled: true },
     maintenance: {},
@@ -66,6 +68,20 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ openTerminalInFeishu: true }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ openTerminalInFeishu: true });
+  });
+
+  it('writes enableLocalCliOpen toggle', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ enableLocalCliOpen: true }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ enableLocalCliOpen: true });
+  });
+
+  it('writes localCliOpenMode enum', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ localCliOpenMode: 'resume' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ localCliOpenMode: 'resume' });
   });
 
   it('writes chatBotDiscovery toggle (off) through the dashboard segment', async () => {
@@ -163,6 +179,23 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('unreachable');
     expect(r.error).toBe('invalid_openTerminalInFeishu');
+  });
+
+  it('rejects non-boolean enableLocalCliOpen → invalid_enableLocalCliOpen', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ enableLocalCliOpen: 'yes' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_enableLocalCliOpen');
+  });
+
+  it('rejects invalid localCliOpenMode enum → invalid_localCliOpenMode', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ localCliOpenMode: 'tmux' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toBe('invalid_localCliOpenMode');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it('rejects non-object whiteboard → invalid_whiteboard', async () => {

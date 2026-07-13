@@ -543,6 +543,7 @@ async function loadAuthState(): Promise<void> {
       isAuthed = !!j.authed;
       ui.authed = isAuthed;
       publicReadOnly = !!(j.settings && j.settings.publicReadOnly);
+      ui.publicReadOnly = publicReadOnly;
       const serverLocale = normalizeDashboardLocale(j.lang);
       if (serverLocale) ui.setLocale(serverLocale);
     }

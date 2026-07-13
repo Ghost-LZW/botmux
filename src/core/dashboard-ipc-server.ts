@@ -35,7 +35,7 @@ import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, getUserProfile, resolveAllowedUsersWithMap } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -60,6 +60,7 @@ import { triggerWorkflowFromEnvelope } from '../workflows/trigger-from-envelope.
 import type { TriggerInput, TriggerResult } from '../workflows/trigger-run.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
+import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 
 // Workflow runner is wired by the daemon (it owns the heavy triggerWorkflowRun
 // deps). Until set, workflow-targeted triggers report not-implemented.
@@ -463,14 +464,42 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
       [...new Set(messages.filter(m => m.senderType === 'user' && m.senderId).map(m => m.senderId))]
         .map(async id => { senders.set(id, await getUserProfile(appId, id)); }),
     );
+    // Bot sender ids are scoped to the observing app. Reuse the chat-member
+    // resolver (cross-ref + observed bot roster) instead of assuming every
+    // non-user message came from the bot that owns this dashboard session.
+    const botMembers: ChatBotMember[] = await listChatBotMembers(appId, session.chatId).catch(() => [] as ChatBotMember[]);
+    let botInfos: HistoryBotInfo[] = [];
+    try {
+      const parsed = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf8'));
+      if (Array.isArray(parsed)) botInfos = parsed;
+    } catch { /* missing/corrupt cache degrades to name/open_id placeholders */ }
+    // listChatBotMembers can be temporarily unavailable during startup. Always
+    // retain a local self-bot fallback so its own messages still have identity.
+    try {
+      const self = getBot(appId);
+      if (self.botOpenId && !botMembers.some(member => member.openId === self.botOpenId)) {
+        const selfName = self.botName || appId;
+        botMembers.push({
+          openId: self.botOpenId,
+          displayName: selfName,
+          name: selfName,
+          larkAppId: appId,
+          source: 'configured',
+          mentionable: true,
+          mentionSource: 'self',
+          hasTeamRole: false,
+        });
+      }
+      if (!botInfos.some(info => info.larkAppId === appId)) {
+        botInfos.push({ larkAppId: appId, botOpenId: self.botOpenId, botName: self.botName, botAvatarUrl: self.botAvatarUrl });
+      }
+    } catch { /* session record may outlive a removed bot config */ }
+
     jsonRes(res, 200, {
       ok: true,
       scope: session.scope ?? 'thread',
       ownerOpenId: session.ownerOpenId,
-      messages: messages.map(m => {
-        const p = m.senderType === 'user' ? senders.get(m.senderId) : null;
-        return p ? { ...m, senderName: p.name, senderAvatar: p.avatarUrl } : m;
-      }),
+      messages: enrichHistorySenders(messages, senders, botMembers, botInfos),
     });
   } catch (err: any) {
     jsonRes(res, 502, { ok: false, error: String(err?.message ?? err) });

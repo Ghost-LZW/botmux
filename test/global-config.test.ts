@@ -30,10 +30,27 @@ describe('global dashboard config', () => {
       dashboard: {
         publicReadOnly: 'yes',
         openTerminalInFeishu: true,
+        enableLocalCliOpen: true,
+        localCliOpenMode: 'resume',
       },
     }));
 
-    expect(readGlobalConfig().dashboard).toEqual({ openTerminalInFeishu: true });
+    expect(readGlobalConfig().dashboard).toEqual({
+      openTerminalInFeishu: true,
+      enableLocalCliOpen: true,
+      localCliOpenMode: 'resume',
+    });
+  });
+
+  it('drops invalid dashboard.localCliOpenMode values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: {
+        enableLocalCliOpen: true,
+        localCliOpenMode: 'tmux',
+      },
+    }));
+
+    expect(readGlobalConfig().dashboard).toEqual({ enableLocalCliOpen: true });
   });
 
   it('reads dashboard.chatBotDiscovery as a boolean (off)', () => {
@@ -145,13 +162,14 @@ describe('global dashboard config', () => {
       },
     }));
 
-    const typed = mergeDashboardConfig({ publicReadOnly: false, openTerminalInFeishu: true });
+    const typed = mergeDashboardConfig({ publicReadOnly: false, openTerminalInFeishu: true, localCliOpenMode: 'attach' });
     const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
 
-    expect(typed).toEqual({ publicReadOnly: false, openTerminalInFeishu: true });
+    expect(typed).toEqual({ publicReadOnly: false, openTerminalInFeishu: true, localCliOpenMode: 'attach' });
     expect(raw.lang).toBe('zh');
     expect(raw.dashboard.futureSetting).toBe('keep-me');
     expect(raw.dashboard.publicReadOnly).toBe(false);
     expect(raw.dashboard.openTerminalInFeishu).toBe(true);
+    expect(raw.dashboard.localCliOpenMode).toBe('attach');
   });
 });
