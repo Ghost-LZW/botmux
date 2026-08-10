@@ -17,7 +17,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
-import { resolveBotmuxConfigDir } from './core/config-dir.js';
+import { resolveBotmuxConfigDir, resolveBotsConfigFile } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
@@ -2040,10 +2040,8 @@ export function normalizeUsageDisplay(entry: {
  *  requiring the registry to have been loaded (works in one-shot CLI processes
  *  like `botmux send`). Returns null when no config file exists. */
 function botsConfigDiskPath(): string | null {
-  const env = process.env.BOTS_CONFIG;
-  if (env) { const r = resolve(env); return existsSync(r) ? r : null; }
-  const d = resolve(resolveBotmuxConfigDir(), 'bots.json');
-  return existsSync(d) ? d : null;
+  const r = resolveBotsConfigFile();
+  return existsSync(r) ? r : null;
 }
 
 /**
@@ -2188,7 +2186,10 @@ function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
 }
 
 function resolveBotConfigPath(): string {
-  // 1. BOTS_CONFIG env var
+  // 1. BOTS_CONFIG env var — an EXACT file, and the top of the chain. For a
+  //    daemon-spawned CLI child this is the path the daemon pinned (its own
+  //    getLoadedConfigPath), which is what makes child and daemon agree under a
+  //    non-default HOME. See core/config-dir.ts for the full rationale.
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
     const resolved = resolve(botsConfigPath);
@@ -2199,8 +2200,8 @@ function resolveBotConfigPath(): string {
     return resolved;
   }
 
-  // 2. <config dir>/bots.json (BOTMUX_CONFIG_DIR, else ~/.botmux)
-  const defaultPath = resolve(resolveBotmuxConfigDir(), 'bots.json');
+  // 2. <config dir>/bots.json (i.e. $HOME/.botmux/bots.json)
+  const defaultPath = resolveBotsConfigFile();
   if (existsSync(defaultPath)) {
     loadedConfigPath = defaultPath;
     return defaultPath;

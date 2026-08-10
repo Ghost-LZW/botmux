@@ -86,7 +86,7 @@ import { riffWorkerShutdownInputBlocker } from './core/riff-worker-shutdown-read
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
-import { resolveBotmuxConfigDir } from './core/config-dir.js';
+import { resolveChildBotsConfig } from './core/config-dir.js';
 import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
@@ -12377,13 +12377,28 @@ async function spawnCli(
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
-  // Pin the config root so the child's `botmux send` reads the SAME registry
-  // this daemon loaded. Required when the daemon runs under a non-default HOME
-  // (`HOME=~/alt botmux start`): the child inherits BOTMUX_* but not HOME, so it
-  // would otherwise resolve the default ~/.botmux and fail "Bot not registered".
-  // Always set (not just in the divergent case) so the child never re-derives a
-  // root from its own HOME — one source of truth, same as SESSION_DATA_DIR.
-  childEnv.BOTMUX_CONFIG_DIR = resolveBotmuxConfigDir(process.env);
+  // Pin the EXACT bots.json this daemon loaded so the child's `botmux send`
+  // reads the SAME registry. Required when the daemon runs under a non-default
+  // HOME (`HOME=~/alt botmux start`): the child inherits BOTMUX_* but not HOME,
+  // so it would otherwise resolve the default ~/.botmux and fail "Bot not
+  // registered".
+  //
+  // Why BOTS_CONFIG (a FILE) and not a config-DIR hint: BOTS_CONFIG is the TOP
+  // of the registry precedence chain and may name an arbitrary filename, so a
+  // dir-shaped hint would (a) guess `bots.json` wrongly for a custom filename
+  // and (b) rank BELOW an ambient stale BOTS_CONFIG in a shared tmux server's
+  // global env — which would silently hand the child a foreign registry.
+  // cfg.loadedBotsConfigPath is the daemon-frozen getLoadedConfigPath(), already
+  // the host-owned authority the sandbox fs-policy denies on.
+  //
+  // Always assign or DELETE, never leave it to chance: an inherited value must
+  // not survive when the daemon has no loaded path (core-only synthesis), or it
+  // would redirect the child to whatever registry that stale path names.
+  {
+    const pinned = resolveChildBotsConfig(cfg.loadedBotsConfigPath, { exists: existsSync });
+    if (pinned) childEnv.BOTS_CONFIG = pinned;
+    else delete childEnv.BOTS_CONFIG;
+  }
   // Explicit, HOST-DECIDED read-isolation marker. The CLI needs to tell
   // "bots.json is denied because I'm sandboxed (expected)" from "bots.json is
   // unreadable (real fault)" — see underReadIsolation() in read-isolation.ts.

@@ -231,13 +231,24 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
-  // Config root this fleet's registry lives under. Injected so a CLI child can
-  // find the SAME bots.json the daemon loaded even when the daemon runs under a
-  // non-default HOME (`HOME=~/alt botmux start`): the child inherits cwd and the
-  // BOTMUX_* family but never HOME, so without this it resolves the *default*
-  // ~/.botmux, misses its own appId, and every `botmux send` from inside that
-  // session fails "Bot not registered". A path, not a credential.
-  'BOTMUX_CONFIG_DIR',
+  // The EXACT bots.json the daemon loaded (getLoadedConfigPath, frozen host-side
+  // and pinned by spawnCli). Injected so a CLI child reads the SAME registry even
+  // when the daemon runs under a non-default HOME (`HOME=~/alt botmux start`): the
+  // child inherits cwd and the BOTMUX_* family but never HOME, so without this it
+  // resolves the *default* ~/.botmux, misses its own appId, and every `botmux
+  // send` from inside that session fails "Bot not registered". A path, not a
+  // credential (the file it names holds secrets; the name does not).
+  //
+  // Being on THIS list is load-bearing in three separate ways, so do not move it:
+  //  · buildBotmuxEnvAssignments forwards it into tmux/zellij panes (without it,
+  //    only the pty backend would be fixed);
+  //  · isBotmuxManagedTmuxEnvKey strips it from the tmux CLIENT env, so botmux
+  //    never seeds a shared server's GLOBAL env with a fleet's registry path;
+  //  · PANE_ENV_UNSET_CLAUSE unsets it in the pane wrapper, so a stale value
+  //    already in a co-tenant server's global env cannot outrank the pinned one
+  //    (BOTS_CONFIG is the TOP of the registry precedence chain — a stale value
+  //    silently redirects the child to a foreign registry).
+  'BOTS_CONFIG',
   'BOTMUX_ROOT_MESSAGE_ID',
   // Session owner (standard name; `__OWNER_OPEN_ID` above is the legacy
   // channel). Custom CLI wrappers read it for per-user permission isolation.
