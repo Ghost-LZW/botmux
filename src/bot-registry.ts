@@ -17,7 +17,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
-import { resolveBotmuxConfigDir, resolveBotsConfigFile } from './core/config-dir.js';
+import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
@@ -1661,6 +1661,7 @@ const bots = new Map<string, BotState>();
 export function __testOnly_resetBotRegistry(): void {
   bots.clear();
   loadedConfigPath = undefined;
+  loadedConfigProvenance = undefined;
   oncallChatCache = null;
   brandLabelCache = null;
   cachedLarkUploadHttpInstance = undefined;
@@ -1673,8 +1674,25 @@ setBotLookup((id) => bots.get(id));
 
 /** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
 let loadedConfigPath: string | undefined;
+/**
+ * PROVENANCE of {@link loadedConfigPath} — whether that path was actually PARSED
+ * (`'loaded'`) or is only a synthetic placeholder (`'synthetic'`, core-only).
+ * Tracked as its own fact because it is NOT recoverable later: the path alone
+ * cannot say whether it was read, and probing the filesystem answers a different
+ * question (existence), which is wrong in both directions. See
+ * `core/config-dir.ts` BotsConfigProvenance for the full rationale.
+ */
+let loadedConfigProvenance: BotsConfigProvenance | undefined;
 export function getLoadedConfigPath(): string | undefined {
   return loadedConfigPath;
+}
+/**
+ * Provenance of `getLoadedConfigPath()`. `undefined` when nothing has been
+ * resolved yet. Consumed by the worker to decide whether the path is a real
+ * registry authority worth pinning onto a CLI child's `BOTS_CONFIG`.
+ */
+export function getLoadedConfigProvenance(): BotsConfigProvenance | undefined {
+  return loadedConfigProvenance;
 }
 
 // Route Lark SDK output through our logger so it inherits the same sink
@@ -2182,6 +2200,11 @@ function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
   // cliId check, defaults). Pin loadedConfigPath to the default in-root path.
   const configs = parseBotConfigsFromText(JSON.stringify([entry]));
   loadedConfigPath = resolve(resolveBotmuxConfigDir(), 'bots.json');
+  // SYNTHETIC, emphatically not 'loaded': nothing was parsed from that path (it
+  // is ignored by design here and may not exist). Recording this keeps the
+  // placeholder from being propagated to CLI children as a registry authority —
+  // the fs-policy still gets the in-root path it needs.
+  loadedConfigProvenance = 'synthetic';
   return configs;
 }
 
@@ -2194,16 +2217,30 @@ function resolveBotConfigPath(): string {
   if (botsConfigPath) {
     const resolved = resolve(botsConfigPath);
     if (!existsSync(resolved)) {
-      throw new Error(`BOTS_CONFIG file not found: ${resolved}`);
+      // FAIL CLOSED, and deliberately so. For a daemon-spawned CLI child this
+      // path is the registry the daemon actually parsed (pinned by spawnCli), so
+      // "it is gone now" must NOT degrade into "resolve my own HOME's default
+      // bots.json" — under a multi-fleet non-default HOME that default is a
+      // DIFFERENT fleet's registry, and quietly switching authority would run
+      // this bot against another fleet's secret and routing. Losing the file is
+      // an operator-visible fault; changing registries behind their back is worse.
+      throw new Error(
+        `BOTS_CONFIG file not found: ${resolved}`
+        + ` — refusing to fall back to a different registry.`
+        + ` (For a botmux-spawned CLI this is the exact bots.json the daemon loaded;`
+        + ` if it was moved or unmounted, restore it or restart the daemon.)`,
+      );
     }
     loadedConfigPath = resolved;
+    loadedConfigProvenance = 'loaded';
     return resolved;
   }
 
-  // 2. <config dir>/bots.json (i.e. $HOME/.botmux/bots.json)
+  // 2. <config dir>/bots.json (i.e. os.homedir()/.botmux/bots.json)
   const defaultPath = resolveBotsConfigFile();
   if (existsSync(defaultPath)) {
     loadedConfigPath = defaultPath;
+    loadedConfigProvenance = 'loaded';
     return defaultPath;
   }
 

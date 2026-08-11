@@ -1,7 +1,11 @@
 /**
  * Resolve Botmux's configuration directory (`~/.botmux`) and the bots.json
  * registry inside it, from ONE canonical precedence rule that matches the
- * registry loader: `BOTS_CONFIG` (exact file) > `$HOME/.botmux/bots.json`.
+ * registry loader: `BOTS_CONFIG` (exact file) > `os.homedir()/.botmux/bots.json`.
+ *
+ * The home half is `os.homedir()` — deliberately the SAME single semantic
+ * `cli.ts` uses — NOT a hand-rolled `HOME`/`USERPROFILE` read, which forks from
+ * `cli.ts` on win32. See {@link resolveBotmuxConfigDir} for the platform contract.
  *
  * ── The bug this closes ──────────────────────────────────────────────────────
  * `HOME=~/alt botmux start` makes the daemon load `~/alt/.botmux/bots.json`, but
@@ -50,8 +54,14 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
 export interface ResolveBotmuxConfigDirOptions {
+  /**
+   * Consulted for `BOTS_CONFIG` ONLY (see {@link resolveBotsConfigFile}) —
+   * never to derive the home directory. Reading `HOME`/`USERPROFILE` here would
+   * fork the config dir away from `cli.ts`'s `join(homedir(), '.botmux')` on
+   * win32; see {@link resolveBotmuxConfigDir}.
+   */
   env?: NodeJS.ProcessEnv;
-  /** Test seam; defaults to HOME/USERPROFILE from env, then os.homedir(). */
+  /** Test seam ONLY (production passes nothing); defaults to os.homedir(). */
   homeDir?: string;
 }
 
@@ -68,7 +78,34 @@ export interface ResolveBotmuxConfigDirOptions {
 export const BOTS_CONFIG_ENV = 'BOTS_CONFIG';
 
 /**
- * Priority: `$HOME/.botmux` (`HOME` → `USERPROFILE` → `os.homedir()`).
+ * `<home>/.botmux`, where `<home>` is `os.homedir()` — the SAME single semantic
+ * `cli.ts` uses for `CONFIG_DIR` / `DATA_DIR` / `PM2_HOME` / `BOTS_JSON_FILE`
+ * and the dashboard write path (`cli.ts`: `join(homedir(), '.botmux')`).
+ *
+ * ── Why NOT `env.HOME ?? env.USERPROFILE ?? homedir()` ───────────────────────
+ * Because `os.homedir()` is ALREADY the env-following rule, per platform, and
+ * re-deriving it by hand gets the platform wrong. Node's contract
+ * (https://nodejs.org/api/os.html#oshomedir):
+ *   · POSIX — uses `$HOME` when set, else getpwuid(). So `HOME=~/alt botmux …`
+ *     relocates the config dir with NO extra code; the hand-rolled `HOME` arm
+ *     buys nothing here.
+ *   · win32 — uses `%USERPROFILE%`; `HOME` is NOT consulted.
+ * A HOME-first rule therefore FORKS from `cli.ts` on win32 whenever `HOME` and
+ * `USERPROFILE` are both set to different values (Git-for-Windows/MSYS shells set
+ * `HOME`): `setup`/`start`/PM2 would write `%USERPROFILE%\.botmux` while the
+ * daemon's registry read `%HOME%\.botmux` — reconstructing the very daemon/child
+ * registry split this module exists to close, on a platform the repo supports
+ * (win32 PM2 / Task Scheduler / `.cmd` wrapper paths). master's bot-registry used
+ * bare `homedir()` and agreed with `cli.ts`, so a HOME-first rule here is a
+ * REGRESSION, not a new feature (verified in review, round 2).
+ *
+ * A hand-rolled env read is also wrong in a platform-INDEPENDENT way: `??` is
+ * nullish, so `HOME=''` (which does occur in stripped service environments) is
+ * accepted as a real value and `join('', '.botmux')` yields the RELATIVE,
+ * cwd-dependent `.botmux`. `homedir()` has no such hole on POSIX — an empty
+ * `$HOME` falls through to getpwuid().
+ *
+ * Custom homes in TESTS go through the `homeDir` seam, never through env.
  *
  * Note this resolves the DIRECTORY only, and is therefore NOT the whole story
  * for the registry: `BOTS_CONFIG` may point at an arbitrary file outside this
@@ -77,14 +114,16 @@ export const BOTS_CONFIG_ENV = 'BOTS_CONFIG';
 export function resolveBotmuxConfigDir(
   options: ResolveBotmuxConfigDirOptions = {},
 ): string {
-  const env = options.env ?? process.env;
-  const home = options.homeDir ?? env.HOME ?? env.USERPROFILE ?? homedir();
-  return join(home, '.botmux');
+  return join(options.homeDir ?? homedir(), '.botmux');
 }
 
 /**
  * The bots.json path implied by the environment: `BOTS_CONFIG` (absolute-ized
  * against cwd, exactly as the loader does) else `<config dir>/bots.json`.
+ *
+ * `env` is consulted for `BOTS_CONFIG` ONLY. The home half comes from
+ * {@link resolveBotmuxConfigDir} (i.e. `os.homedir()`), so this never re-derives
+ * a home from `HOME`/`USERPROFILE` and cannot fork from `cli.ts` on win32.
  *
  * Existence is NOT checked here — callers differ on what an absent file means
  * (the loader throws for an explicit `BOTS_CONFIG`, degrades for the default).
@@ -99,34 +138,57 @@ export function resolveBotsConfigFile(
 }
 
 /**
+ * Where a `loadedBotsConfigPath` came from. This is the PROVENANCE the pin
+ * decision turns on, and it is carried explicitly because it is NOT derivable
+ * from the path or from the filesystem:
+ *
+ *  · `'loaded'`  — the daemon actually opened and parsed this exact file
+ *                  (`resolveBotConfigPath` set it). It is the registry authority.
+ *  · `'synthetic'` — nothing was parsed. Core-only synthesis
+ *                  (`maybeSynthesizeCoreOnlyConfig`) pins the DEFAULT
+ *                  `<config dir>/bots.json` purely so the no-transport fs-policy
+ *                  sees the config inside the default authority root; that file
+ *                  is ignored by design and may not even exist.
+ *
+ * Round 2 of review proved why an `existsSync` probe cannot stand in for this:
+ * existence and provenance are independent, so the probe is wrong in BOTH
+ * directions. A real loaded file that later vanished reads as "absent" and the
+ * pin gets dropped (the child then silently loads a FOREIGN registry from its own
+ * HOME); a synthetic placeholder that happens to exist reads as "present" and
+ * gets pinned even though the daemon never parsed it.
+ */
+export type BotsConfigProvenance = 'loaded' | 'synthetic';
+
+/**
  * Decide the `BOTS_CONFIG` value to pin onto a spawned CLI child.
  *
- * `loadedConfigPath` is the daemon's frozen `getLoadedConfigPath()` — the file
- * it actually parsed. When present it wins unconditionally (absolute-ized for
- * the same cwd-independence reason a relative path is never trusted).
+ * The rule is provenance-driven, NOT existence-driven:
  *
- * Returns null when the daemon has no usable loaded path. Callers must then
- * DELETE `BOTS_CONFIG` from the child env rather than leave an inherited value
- * in place: an ambient stale value outranks the on-disk default and would hand
- * the child a foreign registry.
+ *  · provenance `'loaded'` → pin UNCONDITIONALLY (absolute-ized, since daemon /
+ *    worker / pane share no cwd). Even if the file has since vanished, the pin
+ *    stays: the child must then FAIL LOUDLY in the loader
+ *    (`BOTS_CONFIG file not found`, bot-registry.ts) rather than silently switch
+ *    authority to whatever `<its own HOME>/.botmux/bots.json` contains. Under a
+ *    multi-fleet non-default HOME that fallback is a DIFFERENT registry — same
+ *    appId can carry another fleet's secret and another oncall routing — so
+ *    "fail closed" is strictly correct and "degrade gracefully" is the bug.
+ *    (A read-ISOLATED child still works: Seatbelt allows the metadata read, so
+ *    the loader's `existsSync` passes and its `EPERM + underReadIsolation`
+ *    branch takes over.)
  *
- * `exists` (injected so this module stays fs-free and unit-testable) guards the
- * one case where pinning would be strictly worse than not pinning: core-only
- * synthesis pins `loadedConfigPath` to the DEFAULT `~/.botmux/bots.json` even
- * though it never read that file, and it may not exist. `BOTS_CONFIG` naming a
- * missing file is a hard `throw` in the loader, whereas the unpinned default
- * path degrades gracefully — so an absent target falls back to null. Note a
- * read-ISOLATED child still pins correctly: Seatbelt denies the content read but
- * allows the metadata read, so the file "exists" here and the loader's
- * EPERM+underReadIsolation branch handles it.
+ *  · provenance `'synthetic'` (or no path at all) → return null, and the caller
+ *    must DELETE `BOTS_CONFIG` from the child env rather than leave an inherited
+ *    value: `BOTS_CONFIG` is the TOP of the precedence chain, so a stale ambient
+ *    value would outrank the on-disk default and hand the child a foreign
+ *    registry. Omitting it is right here precisely because nothing was parsed —
+ *    there is no authority to propagate.
  */
 export function resolveChildBotsConfig(
   loadedConfigPath: string | undefined,
-  opts: { exists?: (path: string) => boolean } = {},
+  provenance: BotsConfigProvenance | undefined,
 ): string | null {
+  if (provenance !== 'loaded') return null;
   const trimmed = loadedConfigPath?.trim();
   if (!trimmed) return null;
-  const absolute = isAbsolute(trimmed) ? trimmed : resolve(trimmed);
-  if (opts.exists && !opts.exists(absolute)) return null;
-  return absolute;
+  return isAbsolute(trimmed) ? trimmed : resolve(trimmed);
 }

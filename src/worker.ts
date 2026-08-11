@@ -12391,11 +12391,20 @@ async function spawnCli(
   // cfg.loadedBotsConfigPath is the daemon-frozen getLoadedConfigPath(), already
   // the host-owned authority the sandbox fs-policy denies on.
   //
-  // Always assign or DELETE, never leave it to chance: an inherited value must
-  // not survive when the daemon has no loaded path (core-only synthesis), or it
-  // would redirect the child to whatever registry that stale path names.
+  // The decision turns on PROVENANCE, never on whether the file exists right now.
+  // A real 'loaded' authority is pinned UNCONDITIONALLY, even if it has since
+  // vanished: the child then fails loudly in the loader ("BOTS_CONFIG file not
+  // found") instead of silently falling back to `<its own HOME>/.botmux/bots.json`,
+  // which under a multi-fleet non-default HOME is a DIFFERENT registry (another
+  // fleet's secret + routing under the same appId). A 'synthetic' core-only
+  // placeholder was never parsed, so there is no authority to propagate and the
+  // key is DELETED — an inherited stale value must not survive either, because
+  // BOTS_CONFIG tops the precedence chain.
   {
-    const pinned = resolveChildBotsConfig(cfg.loadedBotsConfigPath, { exists: existsSync });
+    const pinned = resolveChildBotsConfig(
+      cfg.loadedBotsConfigPath,
+      cfg.loadedBotsConfigProvenance,
+    );
     if (pinned) childEnv.BOTS_CONFIG = pinned;
     else delete childEnv.BOTS_CONFIG;
   }

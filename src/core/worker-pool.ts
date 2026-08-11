@@ -66,7 +66,7 @@ import {
 } from '../adapters/backend/session-backend-selector.js';
 import { isRiffBackendSession, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, managedTargetsForCliChange, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
@@ -6585,6 +6585,12 @@ export function forkWorker(
     // rather than silently masking an arbitrary parent dir (codex P1). Omitted
     // from forkAdoptWorker below — its observe branch returns before fs-policy.
     loadedBotsConfigPath: getLoadedConfigPath(),
+    // PROVENANCE of that path: 'loaded' = the daemon actually parsed this exact
+    // file (a real registry authority, safe to pin onto CLI children);
+    // 'synthetic' = core-only placeholder that was never parsed. The worker must
+    // not guess this from the filesystem — existence and provenance are
+    // independent facts (see core/config-dir.ts BotsConfigProvenance).
+    loadedBotsConfigProvenance: getLoadedConfigProvenance(),
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
