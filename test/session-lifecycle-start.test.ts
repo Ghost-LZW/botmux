@@ -57,6 +57,10 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getLoadedConfigPath: vi.fn(() => '/home/u/.botmux/bots.json'),
+  // Provenance travels with the path (see core/config-dir.ts): 'loaded' = the
+  // daemon really parsed that file, which is what forkWorker freezes into the
+  // worker init message alongside loadedBotsConfigPath.
+  getLoadedConfigProvenance: vi.fn(() => 'loaded' as const),
   loadBotConfigs: vi.fn(() => [{
     larkAppId: 'app_test',
     larkAppSecret: 'secret',
