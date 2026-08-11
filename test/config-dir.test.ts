@@ -322,7 +322,7 @@ describe('worker spawnCli wiring (source lock)', () => {
   });
 
   it('cli.ts and the registry share ONE home semantic (no win32 fork)', () => {
-    // Blocking 2: cli.ts owns setup/start/PM2_HOME/dashboard paths via
+    // cli.ts owns setup/start/PM2_HOME/dashboard paths via
     // `join(homedir(), '.botmux')`. The registry's config dir must resolve from
     // the same homedir() — never a hand-rolled HOME/USERPROFILE precedence.
     const configDirSource = readFileSync(resolvePath('src/core/config-dir.ts'), 'utf8');

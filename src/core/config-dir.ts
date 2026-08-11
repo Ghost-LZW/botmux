@@ -96,8 +96,8 @@ export const BOTS_CONFIG_ENV = 'BOTS_CONFIG';
  * daemon's registry read `%HOME%\.botmux` — reconstructing the very daemon/child
  * registry split this module exists to close, on a platform the repo supports
  * (win32 PM2 / Task Scheduler / `.cmd` wrapper paths). master's bot-registry used
- * bare `homedir()` and agreed with `cli.ts`, so a HOME-first rule here is a
- * REGRESSION, not a new feature (verified in review, round 2).
+ * bare `homedir()` and agreed with `cli.ts`, so a HOME-first rule here would be a
+ * REGRESSION, not a new feature.
  *
  * A hand-rolled env read is also wrong in a platform-INDEPENDENT way: `??` is
  * nullish, so `HOME=''` (which does occur in stripped service environments) is
@@ -150,7 +150,7 @@ export function resolveBotsConfigFile(
  *                  sees the config inside the default authority root; that file
  *                  is ignored by design and may not even exist.
  *
- * Round 2 of review proved why an `existsSync` probe cannot stand in for this:
+ * An `existsSync` probe cannot stand in for this:
  * existence and provenance are independent, so the probe is wrong in BOTH
  * directions. A real loaded file that later vanished reads as "absent" and the
  * pin gets dropped (the child then silently loads a FOREIGN registry from its own
