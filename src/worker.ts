@@ -732,11 +732,23 @@ function persistentPaneInfo(backendType: string, sessionId: string): { name: str
   return { name, live };
 }
 
-function persistentPaneLive(backendType: PersistentBackendType, name: string): boolean {
-  if (backendType === 'tmux') return TmuxBackend.hasSession(name);
-  if (backendType === 'zellij') return ZellijBackend.hasSession(name);
-  if (backendType === 'herdr') return HerdrBackend.hasSession(name);
-  return ZmxBackend.hasSession(name);
+/** Tri-state pane liveness, for callers that must not read "no answer" as an
+ *  answer. The `hasSession()` helpers collapse an unanswered probe into
+ *  `false`, which is safe where a wrong guess just means "treat as fresh" but
+ *  NOT where the boolean is consumed as proof that a kill succeeded. Every
+ *  backend already classifies this correctly; only the boolean wrapper threw
+ *  the distinction away. */
+function persistentPaneProbe(
+  backendType: PersistentBackendType,
+  name: string,
+): 'live' | 'gone' | 'unknown' {
+  const probe: SessionProbe = backendType === 'tmux' ? TmuxBackend.probeSession(name)
+    : backendType === 'zellij' ? ZellijBackend.probeSession(name)
+      : backendType === 'herdr' ? HerdrBackend.probeSession(name)
+        : ZmxBackend.probeSession(name);
+  if (probe === 'exists') return 'live';
+  if (probe === 'missing') return 'gone';
+  return 'unknown';
 }
 
 function probeOwnedZmxSession(
@@ -774,7 +786,7 @@ async function killPersistentSessionVerified(
 ): Promise<boolean> {
   return killAndVerifyPersistentPane(name, {
     kill: (resolvedName) => killPersistentSession(backendType, resolvedName, sessionId),
-    isLive: (resolvedName) => persistentPaneLive(backendType, resolvedName),
+    probeLive: (resolvedName) => persistentPaneProbe(backendType, resolvedName),
     wait: delay,
   });
 }
