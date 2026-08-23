@@ -124,6 +124,60 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
     expect(gate).toContain("if (probeState === 'missing')");
     expect(gate).toContain('existingSessionUnknown');
   });
+
+  /**
+   * F2 regression: `probeSession` collapses a load-timeout AND a
+   * missing/unrunnable binary (ENOENT/EACCES) into the same 'unknown'. Only the
+   * load-timeout may take the spawn-instead-of-gate exemption; a genuinely
+   * absent zellij must still gate to the actionable install card rather than
+   * fall through and crash node-pty with `execvp failed`. The split MUST use a
+   * fork-free PATH check (`locateExecutable`), because a fork-based re-probe
+   * (`--version` / `isAvailable()`) would time out under the very host load
+   * that produced the 'unknown' in the first place.
+   */
+  it('splits an indeterminate zellij probe by a fork-free PATH check (ENOENT gates, load-timeout spawns)', () => {
+    const start = workerSource.indexOf("} else if (effectiveBackend === 'zellij') {");
+    const end = workerSource.indexOf("} else if (effectiveBackend === 'zmx')", start);
+    const gate = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    // Split happens inside the indeterminate branch, keyed on binary presence.
+    const unknownBranch = gate.indexOf('existingSessionUnknown');
+    const pathCheck = gate.indexOf("locateExecutable('zellij'");
+    expect(pathCheck).toBeGreaterThan(unknownBranch);
+    // Absent binary: revoke the exemption AND fail the availability, so
+    // decideBackendGate reaches its terminal `gate` arm with the install reason.
+    expect(gate).toContain('existingSessionUnknown = false');
+    expect(gate).toContain("reason = 'zellij 二进制不在 PATH 上'");
+  });
+
+  it('freezes the zellij existence probe and threads it into selectSessionBackend for reattach', () => {
+    // F1 wiring: the gate records its tri-state answer once and the selector
+    // consumes it (biasing 'unknown' toward reattach), instead of the selector
+    // re-running a load-fragile live probe that would fresh-spawn into a
+    // collision under sustained load.
+    expect(workerSource).toContain('let resolvedZellijSessionProbe: SessionProbe | undefined;');
+    expect(workerSource).toContain('resolvedZellijSessionProbe = probeState;');
+    // Selector wiring: zellij reattaches on exists OR unknown, cold-spawns only
+    // on an authoritative missing.
+    const selectCall = workerSource.indexOf('const selectBackend = () => selectSessionBackend({');
+    const selectEnd = workerSource.indexOf('let selectedBackend = selectBackend();', selectCall);
+    const selectBlock = workerSource.slice(selectCall, selectEnd);
+    expect(selectBlock).toContain("effectiveBackend === 'zellij'");
+    expect(selectBlock).toContain("resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'");
+  });
+
+  it('resets the frozen zellij probe to missing after every post-kill re-selection', () => {
+    // Both persistent teardown gates (read-isolation, mcp-gateway) must refresh
+    // the frozen zellij probe so a re-selection cold-spawns a fresh pane rather
+    // than reattaching to the one they just killed. Fail closed unless proven
+    // still live.
+    const occurrences = workerSource.split(
+      "resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';",
+    ).length - 1;
+    expect(occurrences).toBe(2);
+  });
 });
 
 describe('backendGateUserMessage', () => {

@@ -341,7 +341,15 @@ export function selectSessionBackend(opts: {
 
   if (opts.backendType === 'zellij') {
     const sessionName = ZellijBackend.sessionName(opts.sessionId);
-    const reattach = ZellijBackend.hasSession(sessionName);
+    // Prefer the caller's frozen existence decision when supplied: the worker
+    // resolves a tri-state probe once (biasing an indeterminate answer toward
+    // "reattach", since a live pane is more authoritative than a load-timed-out
+    // probe — the same asymmetry decideBackendGate uses) and refreshes it to
+    // "gone" after any teardown, so a post-kill re-selection cold-spawns rather
+    // than reattaching to what it just removed. A bare live `hasSession()`
+    // cannot tell those two call sites apart, so only fall back to it when no
+    // decision was threaded in (default callers / unit tests).
+    const reattach = opts.hasExistingSession ?? ZellijBackend.hasSession(sessionName);
     return {
       backend: new ZellijBackend(sessionName, { ownsSession: true, isReattach: reattach }),
       isTmuxMode: false,
