@@ -13280,9 +13280,12 @@ async function spawnCli(
         } else if (effectiveBackendType === 'zellij') {
           // Refresh the frozen zellij probe before re-selecting, or the
           // replacement keeps isReattach for the pane this gate just removed.
-          // Fail closed to 'missing' on an inconclusive post-kill probe: unlike
-          // the pre-spawn bias, an unproven answer here must NOT reattach.
-          resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
+          // This gate already threw above unless the post-kill probe proved
+          // 'missing' (an inconclusive answer never gets here), so the pane is
+          // known gone: record that so the re-selection cold-spawns. The
+          // mcp-gateway gate is laxer (it only rejects a proven-live pane), so
+          // its own reset still has to fail closed on 'unknown' explicitly.
+          resolvedZellijSessionProbe = 'missing';
         }
       },
       clearProvenanceVerified: () => {
@@ -13360,6 +13363,18 @@ async function spawnCli(
       );
     }
     if (effectiveBackendType === 'zmx' && paneProbe === 'unknown') {
+      throw new Error(
+        `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+        `could not verify existing ${effectiveBackendType} pane`,
+      );
+    }
+    // zellij's pre-spawn bias reattaches on an indeterminate probe (a live pane
+    // is likelier than a gone one under load). That bias is WRONG for an
+    // MCP-gateway pane: reattaching binds the CLI's MCP client to a relay socket
+    // that cannot survive this worker, and the gate below only cold-resumes on a
+    // proven 'exists'. So an unverifiable zellij pane here must fail closed like
+    // zmx rather than silently reattach to a possibly-dead gateway host.
+    if (effectiveBackendType === 'zellij' && paneProbe === 'unknown') {
       throw new Error(
         `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
         `could not verify existing ${effectiveBackendType} pane`,

@@ -317,7 +317,7 @@ describe('selectSessionBackend', () => {
     expect(selected.isTmuxMode).toBe(false);
     expect(selected.isPipeMode).toBe(false);
     expect(selected.backend.constructor.name).toBe('MockZellijBackend');
-    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false });
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false, reattachDecision: 'auto' });
   });
 
   it('marks an existing zellij session as reattach without making it pipe mode', () => {
@@ -327,7 +327,7 @@ describe('selectSessionBackend', () => {
 
     expect(selected.isZellijMode).toBe(true);
     expect(selected.isPipeMode).toBe(false);
-    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true });
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'auto' });
   });
 
   // F1 regression: the worker resolves zellij existence through a tri-state
@@ -349,7 +349,7 @@ describe('selectSessionBackend', () => {
       hasExistingSession: true,
     });
 
-    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true });
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'frozen' });
     // The threaded decision must WIN — the live re-probe must not be consulted.
     expect(ZellijBackend.hasSession).not.toHaveBeenCalled();
   });
@@ -365,18 +365,18 @@ describe('selectSessionBackend', () => {
       hasExistingSession: false,
     });
 
-    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false });
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false, reattachDecision: 'frozen' });
     expect(ZellijBackend.hasSession).not.toHaveBeenCalled();
   });
 
-  it('falls back to a live zellij hasSession probe when no decision is threaded in', () => {
+  it('falls back to a live zellij hasSession probe (auto mode) when no decision is threaded in', () => {
     // Default callers / tests that do not thread a frozen decision keep the old
-    // behaviour: consult the live probe.
+    // behaviour: consult the live probe AND let spawn() self-heal (auto).
     vi.mocked(ZellijBackend.hasSession).mockReturnValue(true);
 
     const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zellij' });
 
-    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true });
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'auto' });
     expect(ZellijBackend.hasSession).toHaveBeenCalledTimes(1);
   });
 

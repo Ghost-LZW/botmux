@@ -39,6 +39,15 @@ export class ZellijBackend implements SessionBackend {
   private readonly sessionName: string;
   private readonly ownsSession: boolean;
   private reattaching = false;
+  /** When true, the caller has ALREADY resolved reattach-vs-fresh (the worker's
+   *  frozen tri-state probe, refreshed to 'missing' after any teardown). spawn()
+   *  must then honour `reattaching` verbatim and skip its `|| hasSession()`
+   *  self-heal — that live re-probe would re-run the same load-fragile
+   *  `list-sessions` and, on a post-kill session that has not fully died yet,
+   *  flip a frozen `false` back to attach, reattaching to the very pane the
+   *  teardown gate just removed. 'auto' (default) keeps the self-heal for
+   *  callers that did not freeze a decision. */
+  private readonly frozenReattach: boolean;
   private configPath: string | null = null;
   private tmpConfigDir: string | null = null;
   /** Set by kill()/destroySession() so the pty-client exit they cause (an
@@ -60,10 +69,11 @@ export class ZellijBackend implements SessionBackend {
   cliPid?: number;
   cliCwd?: string;
 
-  constructor(sessionName: string, opts?: { ownsSession?: boolean; isReattach?: boolean; paneId?: string }) {
+  constructor(sessionName: string, opts?: { ownsSession?: boolean; isReattach?: boolean; paneId?: string; reattachDecision?: 'frozen' | 'auto' }) {
     this.sessionName = sessionName;
     this.ownsSession = opts?.ownsSession ?? true;
     this.reattaching = opts?.isReattach ?? false;
+    this.frozenReattach = opts?.reattachDecision === 'frozen';
     this.paneId = opts?.paneId ?? null;
   }
 
@@ -136,7 +146,13 @@ export class ZellijBackend implements SessionBackend {
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     // Reattach if the session is already live (daemon restarted, CLI survived).
-    this.reattaching = this.reattaching || ZellijBackend.hasSession(this.sessionName);
+    // Skip this self-heal when the caller froze the decision: a teardown gate
+    // may have just killed the pane and set reattaching=false, and a live
+    // re-probe here (same load-fragile `list-sessions`) could still see the
+    // not-yet-reaped session and wrongly flip us back to attach.
+    if (!this.frozenReattach) {
+      this.reattaching = this.reattaching || ZellijBackend.hasSession(this.sessionName);
+    }
     logger.debug(
       `[zellij:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
       `bin=${bin} args=${JSON.stringify(args)} cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,

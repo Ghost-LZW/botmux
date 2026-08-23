@@ -350,8 +350,13 @@ export function selectSessionBackend(opts: {
     // cannot tell those two call sites apart, so only fall back to it when no
     // decision was threaded in (default callers / unit tests).
     const reattach = opts.hasExistingSession ?? ZellijBackend.hasSession(sessionName);
+    // A threaded-in decision is authoritative — tell the backend to honour it
+    // verbatim and skip spawn()'s `|| hasSession()` self-heal, which would
+    // otherwise re-probe and could reattach to a pane a teardown gate just
+    // removed. Default callers (no decision) keep the self-heal via 'auto'.
+    const reattachDecision = opts.hasExistingSession === undefined ? 'auto' : 'frozen';
     return {
-      backend: new ZellijBackend(sessionName, { ownsSession: true, isReattach: reattach }),
+      backend: new ZellijBackend(sessionName, { ownsSession: true, isReattach: reattach, reattachDecision }),
       isTmuxMode: false,
       isPipeMode: false,
       isZellijMode: true,

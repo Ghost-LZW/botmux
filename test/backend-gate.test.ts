@@ -169,14 +169,49 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
   });
 
   it('resets the frozen zellij probe to missing after every post-kill re-selection', () => {
-    // Both persistent teardown gates (read-isolation, mcp-gateway) must refresh
-    // the frozen zellij probe so a re-selection cold-spawns a fresh pane rather
-    // than reattaching to the one they just killed. Fail closed unless proven
-    // still live.
-    const occurrences = workerSource.split(
-      "resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';",
-    ).length - 1;
-    expect(occurrences).toBe(2);
+    // Both persistent teardown gates must refresh the frozen zellij probe so a
+    // re-selection cold-spawns a fresh pane rather than reattaching to the one
+    // they just killed — but each gate's own strictness differs:
+    //  - read-isolation already throws unless the post-kill probe proved
+    //    'missing', so by then the pane is known gone → assign 'missing'.
+    //  - mcp-gateway only rejects a PROVEN-LIVE pane, so 'unknown' still
+    //    reaches its reset and must fail closed to 'missing' explicitly.
+    // Both post-kill resets are keyed off `postKillProbe`; every one of them
+    // must end at 'missing' so a teardown never leaves a reattachable state.
+    const postKillResets = (workerSource.match(/resolvedZellijSessionProbe = [^;\n]+;/g) ?? [])
+      .filter(r => r.includes('postKillProbe') || r === "resolvedZellijSessionProbe = 'missing';");
+    // 3 = read-isolation confirmPaneGone + mcp-gateway + the not-installed gate
+    // (all three converge on 'missing'); the two teardown ones are the point.
+    expect(postKillResets.length).toBeGreaterThanOrEqual(2);
+    for (const reset of postKillResets) {
+      expect(reset).toContain("'missing'");
+    }
+    // The laxer gate keeps its explicit fail-closed on an unproven answer.
+    expect(workerSource).toContain("resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';");
+    // And the stricter read-isolation gate records the proven-gone pane.
+    const confirmGone = workerSource.indexOf('confirmPaneGone: () => {');
+    const confirmGoneEnd = workerSource.indexOf('clearProvenanceVerified: () => {', confirmGone);
+    expect(confirmGone).toBeGreaterThan(-1);
+    expect(workerSource.slice(confirmGone, confirmGoneEnd))
+      .toContain("resolvedZellijSessionProbe = 'missing';");
+  });
+
+  it('fails closed on an indeterminate zellij pane in the mcp-gateway gate (no silent reattach to a possibly-dead host)', () => {
+    // The pre-spawn bias reattaches zellij on 'unknown', but an MCP-gateway pane
+    // must not: reattaching binds the CLI to a relay socket that cannot survive
+    // this worker, and the gate only cold-resumes on a proven 'exists'. So an
+    // unverifiable zellij pane here must refuse, exactly like zmx.
+    const start = workerSource.indexOf('if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length');
+    const end = workerSource.indexOf('// The plugin set is stable only', start);
+    const gate = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(gate).toContain("if (effectiveBackendType === 'zellij' && paneProbe === 'unknown')");
+    // It must throw (refuse), not fall through into a reattach.
+    const zellijUnknown = gate.indexOf("effectiveBackendType === 'zellij' && paneProbe === 'unknown'");
+    const nextThrow = gate.indexOf('throw new Error', zellijUnknown);
+    expect(nextThrow).toBeGreaterThan(zellijUnknown);
   });
 });
 
