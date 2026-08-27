@@ -174,6 +174,78 @@ describe('ZellijBackend.probeLiveSessions exit-code classification', () => {
     expect(ZellijBackend.probeSession('bmx-anything')).toBe('missing');
   });
 
+  it('degrades to unknown (not missing) if zellij ever reworded the no-sessions line', () => {
+    // Deliberate trade-off: emptiness requires zellij's explicit answer, so an
+    // unrecognised message fails SAFE (unknown → keep the reattach bias) rather
+    // than asserting "gone" from a silent non-zero exit. The message is
+    // hardcoded upstream at our 0.44.0 floor, so this is a future-proofing
+    // direction choice, not a live regression.
+    failWith({ status: 1, stderr: Buffer.from('没有活动的 zellij 会话\n') });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: false });
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('unknown');
+  });
+
+  it('treats a DEADLINE that raced a clean exit as unknown (ETIMEDOUT + numeric status, no signal)', () => {
+    // Minimal counter-example from review: Node's timeout can fire while the
+    // child is exiting, so the error carries ETIMEDOUT *and* a clean status=1
+    // with empty output — indistinguishable from "no sessions" by status alone.
+    // Reading it as 'missing' would turn the exact high-load timeout this PR
+    // exists to tolerate back into an authoritative "gone", and would let the
+    // strict post-kill path treat an unconfirmed kill as proven termination.
+    // Mirrors TmuxBackend.probeSession, which checks the deadline FIRST.
+    failWith({
+      code: 'ETIMEDOUT', status: 1, signal: null,
+      stdout: Buffer.alloc(0), stderr: Buffer.alloc(0),
+    });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: false });
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('unknown');
+  });
+
+  it('lets the DEADLINE win even when the no-sessions line is also present', () => {
+    // This is the case that actually isolates the deadline check: with empty
+    // stderr an ETIMEDOUT would return unknown anyway (via the "needs an
+    // explicit answer" path), so removing the deadline guard would go unnoticed.
+    // Here zellij's real message IS present, so only checking the deadline first
+    // keeps it indeterminate — otherwise a timed-out probe that happened to race
+    // an empty listing becomes an authoritative "gone".
+    failWith({
+      code: 'ETIMEDOUT', status: 1, signal: null,
+      stdout: Buffer.alloc(0), stderr: Buffer.from('No active zellij sessions found.\n'),
+    });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: false });
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('unknown');
+  });
+
+  it('does not call a SILENT non-zero exit empty (needs zellij\'s explicit answer)', () => {
+    // A quiet exit 1 with no stderr proves nothing about liveness.
+    failWith({ status: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: false });
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('unknown');
+  });
+
+  it('does NOT treat a usage error (clap exit 2) as emptiness even with empty stderr', () => {
+    // Real zellij 0.44.1 exits 2 for a bogus flag/subcommand. Such an answer
+    // proves nothing about liveness, so it must stay indeterminate — and an
+    // empty stderr must not sneak it through as "no sessions".
+    failWith({ status: 2, stdout: Buffer.from(''), stderr: Buffer.from('') });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: false });
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('unknown');
+  });
+
+  it('still honours live rows printed alongside a non-zero exit 1', () => {
+    // Defensive: if a future zellij lists sessions AND exits 1, the live rows
+    // are authoritative — do not report a live pane as gone.
+    failWith({ status: 1, stdout: Buffer.from('bmx-live [Created 1s ago] \n'), stderr: Buffer.from('') });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: true, sessions: ['bmx-live'] });
+    expect(ZellijBackend.probeSession('bmx-live')).toBe('exists');
+  });
+
   it('treats a spawn failure (binary absent → no numeric status) as unknown', () => {
     failWith({ code: 'ENOENT', status: undefined, signal: undefined });
 

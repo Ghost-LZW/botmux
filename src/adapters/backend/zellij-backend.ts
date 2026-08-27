@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath, isExecTimeoutError } from './tmux-backend.js';
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
 
@@ -108,6 +108,16 @@ export class ZellijBackend implements SessionBackend {
    *  TmuxBackend.probeSession does: a numeric exit status with no signal is an
    *  ANSWER from zellij; only a signal/timeout or a spawn failure (ENOENT/EACCES
    *  — neither carries a numeric status) means we never got one.
+   *
+   *  The "answered" case is split by EXIT CODE, not by stderr wording alone:
+   *  zellij uses 1 for "listed fine, nothing live" and clap's 2 for usage errors
+   *  (verified against 0.44.1: a bogus flag/subcommand exits 2). But a numeric
+   *  status is only trusted AFTER ruling out a deadline — Node's timeout can
+   *  race the child's own exit and produce `ETIMEDOUT` alongside a clean status
+   *  (see isExecTimeoutError and the tmux-probe regression that pins it), which
+   *  is still "no answer". And a silent non-zero exit is not proof of emptiness:
+   *  we require zellij's explicit "no active sessions" line (or live rows) to
+   *  call it, so anything ambiguous degrades to `unknown` — the safe direction.
    */
   static probeLiveSessions(): { ok: true; sessions: string[] } | { ok: false } {
     let out: string;
@@ -119,30 +129,44 @@ export class ZellijBackend implements SessionBackend {
         env: zellijEnv(),
       });
     } catch (e: any) {
-      // Answered, but non-zero: "no active sessions" is the documented exit-1
-      // case, so treat a clean numeric status as an authoritative empty list.
-      // Anything else (timeout → signal, ENOENT/EACCES → no status) is unknown.
-      if (e && typeof e.status === 'number' && !e.signal) {
-        const stderr = (e.stderr?.toString?.() ?? '').trim();
-        const stdout = (e.stdout?.toString?.() ?? '');
-        if (/no active zellij sessions/i.test(stderr) || (!stdout.trim() && !stderr)) {
-          return { ok: true, sessions: [] };
-        }
-        // A different answered failure (bad flag, corrupt cache, …) is not proof
-        // of emptiness — do not let it read as "session gone".
-        return { ok: false };
+      // Deadline FIRST, before any numeric-status reasoning: when Node's timeout
+      // races the child's own exit, the error carries `code='ETIMEDOUT'` AND a
+      // clean `status` with no signal (see isExecTimeoutError + the
+      // tmux-probe.test.ts regression pinning that exact shape). Reading that as
+      // an answer would turn the very high-load timeout this PR exists to
+      // tolerate back into an authoritative "gone" — and in the strict post-kill
+      // path it would report an unconfirmed termination as proven.
+      if (isExecTimeoutError(e)) return { ok: false };
+      // Not answered at all (killed by a signal, or a spawn failure like
+      // ENOENT/EACCES which carries no numeric status): stay indeterminate.
+      if (!e || typeof e.status !== 'number' || e.signal) return { ok: false };
+      // Answered non-zero. Only exit 1 can mean "listed fine, nothing live";
+      // clap usage/startup errors are 2+ and prove nothing about liveness.
+      if (e.status !== 1) return { ok: false };
+      // If it printed live rows anyway, those win (never report a live pane gone).
+      const rows = ZellijBackend.parseLiveSessionRows(e.stdout?.toString?.() ?? '');
+      if (rows.length > 0) return { ok: true, sessions: rows };
+      // Require zellij's explicit "no active sessions" answer to call it empty.
+      // A SILENT non-zero exit proves nothing — treating it as zero is how an
+      // unconfirmed kill or a half-broken host would read as "session gone".
+      // (The message is hardcoded in zellij since our 0.44.0 floor; a future
+      // rewording degrades to `unknown`, which is the safe direction here.)
+      if (/no active zellij sessions/i.test((e.stderr?.toString?.() ?? '').trim())) {
+        return { ok: true, sessions: [] };
       }
       return { ok: false };
     }
-    return {
-      ok: true,
-      sessions: out
-        .split('\n')
-        .map(l => l.trim())
-        .filter(l => l.length > 0 && !/EXITED/i.test(l))
-        .map(l => l.split(/\s+/)[0]!)
-        .filter(Boolean),
-    };
+    return { ok: true, sessions: ZellijBackend.parseLiveSessionRows(out) };
+  }
+
+  /** Live (non-EXITED) session names from `list-sessions --no-formatting` output. */
+  private static parseLiveSessionRows(raw: string): string[] {
+    return raw
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !/EXITED/i.test(l))
+      .map(l => l.split(/\s+/)[0]!)
+      .filter(Boolean);
   }
 
   static hasSession(name: string): boolean {
