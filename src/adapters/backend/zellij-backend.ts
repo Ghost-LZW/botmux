@@ -98,27 +98,51 @@ export class ZellijBackend implements SessionBackend {
   /** Like liveSessions(), but distinguishes "command failed/timed out" ({ok:false})
    *  from "command succeeded, zero live sessions" ({ok:true, sessions:[]}). The
    *  tri-state probe builds on this so a transient `list-sessions` failure isn't
-   *  read as "session gone". */
+   *  read as "session gone".
+   *
+   *  NOTE zellij exits **1** with stderr `No active zellij sessions found.` when
+   *  there are simply no sessions — an authoritative "zero", not a failure. A
+   *  bare catch would report that clean host as {ok:false} → `unknown`, and any
+   *  caller that biases `unknown` toward reattach would then `zellij attach` a
+   *  name that does not exist (exit 1) on every first start. So classify like
+   *  TmuxBackend.probeSession does: a numeric exit status with no signal is an
+   *  ANSWER from zellij; only a signal/timeout or a spawn failure (ENOENT/EACCES
+   *  — neither carries a numeric status) means we never got one.
+   */
   static probeLiveSessions(): { ok: true; sessions: string[] } | { ok: false } {
+    let out: string;
     try {
-      const out = execFileSync('zellij', ['list-sessions', '--no-formatting'], {
+      out = execFileSync('zellij', ['list-sessions', '--no-formatting'], {
         encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 3000,
         env: zellijEnv(),
       });
-      return {
-        ok: true,
-        sessions: out
-          .split('\n')
-          .map(l => l.trim())
-          .filter(l => l.length > 0 && !/EXITED/i.test(l))
-          .map(l => l.split(/\s+/)[0]!)
-          .filter(Boolean),
-      };
-    } catch {
+    } catch (e: any) {
+      // Answered, but non-zero: "no active sessions" is the documented exit-1
+      // case, so treat a clean numeric status as an authoritative empty list.
+      // Anything else (timeout → signal, ENOENT/EACCES → no status) is unknown.
+      if (e && typeof e.status === 'number' && !e.signal) {
+        const stderr = (e.stderr?.toString?.() ?? '').trim();
+        const stdout = (e.stdout?.toString?.() ?? '');
+        if (/no active zellij sessions/i.test(stderr) || (!stdout.trim() && !stderr)) {
+          return { ok: true, sessions: [] };
+        }
+        // A different answered failure (bad flag, corrupt cache, …) is not proof
+        // of emptiness — do not let it read as "session gone".
+        return { ok: false };
+      }
       return { ok: false };
     }
+    return {
+      ok: true,
+      sessions: out
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l.length > 0 && !/EXITED/i.test(l))
+        .map(l => l.split(/\s+/)[0]!)
+        .filter(Boolean),
+    };
   }
 
   static hasSession(name: string): boolean {
@@ -152,6 +176,23 @@ export class ZellijBackend implements SessionBackend {
     // not-yet-reaped session and wrongly flip us back to attach.
     if (!this.frozenReattach) {
       this.reattaching = this.reattaching || ZellijBackend.hasSession(this.sessionName);
+    }
+    if (this.frozenReattach && this.reattaching) {
+      // A frozen `attach` can still be objectively WRONG: the worker biases an
+      // indeterminate existence probe toward reattach (a live pane is likelier
+      // than a gone one under load), and not every path re-probes before we get
+      // here. `attach` on a session that does not exist exits 1 ("No session
+      // with the name … found!"), which reads as a CLI crash and burns a
+      // restart. So downgrade to a fresh spawn ONLY on an authoritative
+      // 'missing' — an indeterminate answer keeps the reattach bias, and a
+      // frozen `false` is never flipped the other way (that direction is the
+      // teardown guarantee this whole flag exists to protect).
+      if (ZellijBackend.probeSession(this.sessionName) === 'missing') {
+        logger.debug(
+          `[zellij:${this.sessionName}] frozen reattach downgraded to fresh spawn: session is provably absent`,
+        );
+        this.reattaching = false;
+      }
     }
     logger.debug(
       `[zellij:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +

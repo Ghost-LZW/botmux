@@ -67,12 +67,11 @@ describe('ZellijBackend frozen reattach decision', () => {
     expect(args).not.toContain('attach');
   });
 
-  it('honours a frozen isReattach:true without re-probing', () => {
+  it('honours a frozen isReattach:true when the session is live', () => {
     const be = new ZellijBackend(SESSION, { ownsSession: true, isReattach: true, reattachDecision: 'frozen' });
     be.spawn('claude', [], spawnOpts);
 
     expect(be.isReattach).toBe(true);
-    expect(mockedExecFileSync).not.toHaveBeenCalled();
     const args = mockedPtySpawn.mock.calls[0][1] as string[];
     expect(args).toContain('attach');
     expect(args).not.toContain('--new-session-with-layout');
@@ -99,5 +98,112 @@ describe('ZellijBackend frozen reattach decision', () => {
     expect(be.isReattach).toBe(false);
     const args = mockedPtySpawn.mock.calls[0][1] as string[];
     expect(args).toContain('--new-session-with-layout');
+  });
+
+  /**
+   * The reattach bias is a BET, not a fact: the worker reattaches on an
+   * indeterminate existence probe because a live pane is likelier than a gone
+   * one under load. When the session turns out to be provably absent, `attach`
+   * exits 1 ("No session with the name … found!"), which reads as a CLI crash
+   * and burns a restart — so a frozen `attach` must downgrade to a fresh spawn
+   * on an AUTHORITATIVE 'missing'.
+   */
+  it('downgrades a frozen reattach to a fresh spawn when the session is provably absent', () => {
+    mockedExecFileSync.mockReturnValue('' as unknown as Buffer); // authoritative: no live sessions
+    const be = new ZellijBackend(SESSION, { ownsSession: true, isReattach: true, reattachDecision: 'frozen' });
+    be.spawn('claude', [], spawnOpts);
+
+    expect(be.isReattach).toBe(false);
+    const args = mockedPtySpawn.mock.calls[0][1] as string[];
+    expect(args).toContain('--new-session-with-layout');
+    expect(args).not.toContain('attach');
+  });
+
+  it('keeps a frozen reattach when the probe is INDETERMINATE (bias preserved)', () => {
+    // list-sessions failing (timeout/spawn error) is 'unknown', not 'missing' —
+    // the bias must survive it, otherwise the whole point of the fix is lost.
+    mockedExecFileSync.mockImplementation((() => { throw new Error('ETIMEDOUT'); }) as any);
+    const be = new ZellijBackend(SESSION, { ownsSession: true, isReattach: true, reattachDecision: 'frozen' });
+    be.spawn('claude', [], spawnOpts);
+
+    expect(be.isReattach).toBe(true);
+    const args = mockedPtySpawn.mock.calls[0][1] as string[];
+    expect(args).toContain('attach');
+  });
+
+  it('NEVER flips a frozen fresh decision into an attach, even if the session looks live', () => {
+    // The teardown guarantee: the downgrade above is one-directional. A gate that
+    // killed the pane froze `false`; a lingering not-yet-reaped session must not
+    // resurrect the reattach.
+    listSessionsReportsLive();
+    const be = new ZellijBackend(SESSION, { ownsSession: true, isReattach: false, reattachDecision: 'frozen' });
+    be.spawn('claude', [], spawnOpts);
+
+    expect(be.isReattach).toBe(false);
+    const args = mockedPtySpawn.mock.calls[0][1] as string[];
+    expect(args).toContain('--new-session-with-layout');
+    expect(args).not.toContain('attach');
+  });
+});
+
+/**
+ * Root-cause regression (found in review of the rebased head): zellij exits **1**
+ * with stderr `No active zellij sessions found.` when there are simply no
+ * sessions. The original bare `catch` reported that authoritative "zero" as
+ * {ok:false} → `probeSession() === 'unknown'`, so on a CLEAN HOST (the normal
+ * first-start path) the gate granted its indeterminate-probe exemption and the
+ * frozen decision became `attach` — against a name that does not exist, which
+ * exits 1 every time. Verified against real zellij 0.44.1.
+ */
+describe('ZellijBackend.probeLiveSessions exit-code classification', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function failWith(props: Record<string, unknown>) {
+    mockedExecFileSync.mockImplementation((() => {
+      throw Object.assign(new Error('Command failed'), props);
+    }) as any);
+  }
+
+  it('treats the documented "no active sessions" exit 1 as an authoritative EMPTY list', () => {
+    failWith({ status: 1, stderr: Buffer.from('No active zellij sessions found.\n') });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: true, sessions: [] });
+    // The decisive consequence: a clean host reports 'missing', NOT 'unknown'.
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('missing');
+  });
+
+  it('treats a spawn failure (binary absent → no numeric status) as unknown', () => {
+    failWith({ code: 'ENOENT', status: undefined, signal: undefined });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: false });
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('unknown');
+  });
+
+  it('treats a timeout (killed by signal) as unknown', () => {
+    failWith({ code: 'ETIMEDOUT', signal: 'SIGTERM', status: undefined });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: false });
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('unknown');
+  });
+
+  it('does NOT read some other answered failure as emptiness', () => {
+    // A different non-zero exit (bad flag, corrupt cache) is not proof that
+    // zero sessions exist, so it must not become an authoritative 'missing'.
+    failWith({ status: 2, stderr: Buffer.from('error: unexpected argument\n') });
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: false });
+    expect(ZellijBackend.probeSession('bmx-anything')).toBe('unknown');
+  });
+
+  it('still filters EXITED corpses out of a successful listing', () => {
+    mockedExecFileSync.mockReturnValue(
+      'bmx-live [Created 1s ago] \nbmx-dead [Created 2d ago] (EXITED - attach to resurrect)\n' as unknown as Buffer,
+    );
+
+    expect(ZellijBackend.probeLiveSessions()).toEqual({ ok: true, sessions: ['bmx-live'] });
+    expect(ZellijBackend.probeSession('bmx-dead')).toBe('missing');
+    expect(ZellijBackend.probeSession('bmx-live')).toBe('exists');
   });
 });
