@@ -138,7 +138,7 @@ import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
 import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
-import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
+import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup, shouldDeferInitialPromptForReattach } from './core/startup-commands.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
@@ -385,6 +385,9 @@ import {
   backendSandboxCompatibilityError,
   backendSandboxCompatibilityUserMessage,
   decideBackendGate,
+  persistentReattachBias,
+  reconcileBiasedReattachProbe,
+  resolveTmuxBackendGate,
   retireSupersededRecordedHerdrTarget,
   selectSessionBackend,
 } from './adapters/backend/session-backend-selector.js';
@@ -15801,17 +15804,34 @@ async function spawnCli(
   // post-kill re-selection cold-spawns instead of reattaching to the pane it
   // just removed. selectSessionBackend consumes it via hasExistingSession.
   let resolvedZellijSessionProbe: SessionProbe | undefined;
+  // Same frozen tri-state decision for tmux (see resolveTmuxBackendGate): an
+  // indeterminate has-session answer spawns instead of gating AND reattaches
+  // instead of creating, so no pre-spawn fresh-path state is ever built for a
+  // pane that may still be alive. Teardown gates below refresh it to 'missing'.
+  let resolvedTmuxSessionProbe: SessionProbe | undefined;
   {
     let available = true;
     let reason = '';
     let hasExistingSession = false;
     let existingSessionUnknown = false;
     if (effectiveBackend === 'tmux') {
-      hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
-      if (!hasExistingSession) {
-        const probe = probeTmuxFunctionalWithRetry();
-        available = probe.ok;
-        if (!probe.ok) reason = probe.reason;
+      // Tri-state on purpose — `hasSession()` collapses "has-session timed out
+      // under host load" into "no session", which then let the (equally
+      // load-starved) functional probe gate a live pane with the misleading
+      // "tmux 不可用 / install tmux" card. Retry only the indeterminate answer.
+      const tmuxSessionName = TmuxBackend.sessionName(cfg.sessionId);
+      const resolved = resolveTmuxBackendGate({
+        probeSession: () => TmuxBackend.probeSessionWithRetry(tmuxSessionName),
+        binaryOnPath: () => locateExecutable('tmux', tmuxEnv()) !== null,
+        probeFunctional: () => probeTmuxFunctionalWithRetry(),
+      });
+      resolvedTmuxSessionProbe = resolved.probe;
+      available = resolved.available;
+      reason = resolved.reason;
+      hasExistingSession = resolved.hasExistingSession;
+      existingSessionUnknown = resolved.existingSessionUnknown;
+      if (existingSessionUnknown) {
+        log('tmux has-session probe returned no answer but the binary is on PATH (host load); biasing toward reattach instead of gating');
       }
     } else if (effectiveBackend === 'zellij') {
       // Like tmux, zellij's probe is a disposable background session, so a
@@ -16337,9 +16357,30 @@ async function spawnCli(
       ? resolvedZmxSessionProbe === 'exists'
       : effectiveBackend === 'zellij'
         ? resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'
-        : undefined,
+        : effectiveBackend === 'tmux'
+          ? persistentReattachBias(resolvedTmuxSessionProbe)
+          : undefined,
     zmxRecoveryStateDir: isolationRuntimeDataDir,
   });
+  // Settle a reattach that rests on an indeterminate existence probe with one
+  // more look BEFORE anything consumes the selection (read-isolation /
+  // mcp-gateway / credential gates, then the predicted outcome that freezes
+  // the fresh boot marker + isolation wrapper, credential stamp,
+  // startupCommands and initial-prompt routing). An authoritative 'missing'
+  // turns a doomed reattach into a proper cold spawn WITH the fresh-path setup;
+  // a still-'unknown' answer keeps the reattach bias, so the backend never
+  // creates over a possibly-live pane (no duplicate-session swallowing).
+  if (effectiveBackend === 'tmux' || effectiveBackend === 'zellij') {
+    const before = effectiveBackend === 'tmux' ? resolvedTmuxSessionProbe : resolvedZellijSessionProbe;
+    const after = reconcileBiasedReattachProbe(before, () => (effectiveBackend === 'tmux'
+      ? TmuxBackend.probeSessionWithRetry(TmuxBackend.sessionName(cfg.sessionId))
+      : ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))));
+    if (after !== before) {
+      log(`${effectiveBackend} existence re-probe before spawn: ${before} → ${after}`);
+      if (effectiveBackend === 'tmux') resolvedTmuxSessionProbe = after;
+      else resolvedZellijSessionProbe = after;
+    }
+  }
   let selectedBackend = selectBackend();
   isTmuxMode = selectedBackend.isTmuxMode;
   isPipeMode = selectedBackend.isPipeMode;
@@ -16735,6 +16776,8 @@ async function spawnCli(
           // mcp-gateway gate is laxer (it only rejects a proven-live pane), so
           // its own reset still has to fail closed on 'unknown' explicitly.
           resolvedZellijSessionProbe = 'missing';
+        } else if (effectiveBackendType === 'tmux') {
+          resolvedTmuxSessionProbe = 'missing';
         }
       },
       clearProvenanceVerified: () => {
@@ -16845,6 +16888,15 @@ async function spawnCli(
         `could not verify existing ${effectiveBackendType} pane`,
       );
     }
+    // tmux: same reasoning, but only when the reattach itself rests on an
+    // indeterminate probe (an authoritative 'exists' selection keeps the
+    // pre-existing semantics for a transiently unanswered re-probe here).
+    if (effectiveBackendType === 'tmux' && resolvedTmuxSessionProbe === 'unknown' && paneProbe === 'unknown') {
+      throw new Error(
+        `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+        `could not verify existing ${effectiveBackendType} pane`,
+      );
+    }
     if (effectiveBackendType === 'zmx') {
       resolvedZmxSessionProbe = paneProbe;
     }
@@ -16913,6 +16965,8 @@ async function spawnCli(
         // the re-selection cold-spawns a fresh host instead of reattaching to
         // the pane we just killed. Fail closed to 'missing' unless proven live.
         resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
+      } else if (effectiveBackendType === 'tmux') {
+        resolvedTmuxSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
       }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
@@ -16964,6 +17018,8 @@ async function spawnCli(
         resolvedZmxSessionPid = undefined;
       } else if (effectiveBackendType === 'zellij') {
         resolvedZellijSessionProbe = 'missing';
+      } else if (effectiveBackendType === 'tmux') {
+        resolvedTmuxSessionProbe = 'missing';
       }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
@@ -17295,6 +17351,10 @@ async function spawnCli(
     adoptMode: cfg.adoptMode === true,
     dispatchAttempt: cfg.dispatchAttempt,
     queuedActivationToken: cfg.queuedActivationToken,
+  }) || shouldDeferInitialPromptForReattach({
+    willReattachPersistent,
+    adoptMode: cfg.adoptMode === true,
+    passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true)
     || (!promptArgPreparationChanged && shouldDeferInitialPromptForArgLimit({
       passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
